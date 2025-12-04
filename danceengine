@@ -1,0 +1,630 @@
+// -----------------------------------------------------------------------------
+// DANCEENGINE.LSL - Dance HUD engine with menu + notecard sets + dance ball sync
+// -----------------------------------------------------------------------------
+//
+// Behavior:
+// - Receives LM_DANCE_ENGINE "MENU" from Core when the Dance button is pressed.
+// - Shows a menu:
+//      * "Play All"    -> cycle all animations in this prim
+//      * "Select Card" -> choose a dance_ notecard containing a list of anim names
+//      * "Stop"        -> stop animating
+//
+// - dance_ notecards:
+//      * One animation name per line
+//      * Lines starting with "#" are comments
+//      * Blank lines are ignored
+//
+// - Cycles dances every DANCE_INTERVAL seconds
+// - Animates HUD owner only
+// - Respects global debug toggle via LM_DEBUG_MODE
+// - Card menu supports paging so all dance_ cards are reachable.
+//
+// - Integration with dance ball system:
+//      * On each new animation, sends LM_REZ_ENGINE with:
+//            "DANCE_ANIM|<animName>"
+//      * When dance stops, sends LM_REZ_ENGINE with:
+//            "DANCE_STOP"
+//   RezEngine relays these to the rezzed dance ball(s), which then
+//   animate guests and delete themselves when they receive DANCE_STOP.
+// -----------------------------------------------------------------------------
+
+integer LM_DANCE_ENGINE = 1004;
+integer LM_DEBUG_MODE   = 1012;
+integer LM_REZ_ENGINE   = 1003;
+
+float   DANCE_INTERVAL  = 30.0;   // seconds between dance changes
+
+// Dialog paging for card selection
+integer DIALOG_PAGE_SIZE = 9;     // labels per page when paging
+
+// --- Globals ---
+
+key     gOwner         = NULL_KEY;
+key     gDebugOwner    = NULL_KEY;
+integer gDebug         = FALSE;
+integer gHavePerms     = FALSE;
+
+list    gAllAnims       = [];     // all INVENTORY_ANIMATION names in this prim
+list    gDanceNotecards = [];     // list of "dance_..." notecard names
+list    gDanceLabels    = [];     // user-friendly labels (name without "dance_")
+
+list    gActiveAnimList = [];     // current dance list (all or from a card)
+integer gActiveIndex    = -1;
+integer gIsDancing      = FALSE;
+string  gLastAnim       = "";
+
+// Notecard loading
+integer gLoadState     = 0;       // 0 = idle, 1 = loading a dance_ card
+string  gCurrentCard   = "";
+integer gCurrentLine   = 0;
+key     gCurrentQuery  = NULL_KEY;
+list    gTempAnimList  = [];
+
+// Menu state
+integer gMenuChan      = 0;
+integer gMenuHandle    = -1;
+integer gMenuMode      = 0;       // 0 = root menu, 1 = select card
+integer MENU_ROOT      = 0;
+integer MENU_CARD      = 1;
+
+// Paging state for card menu
+integer gCardPage      = 0;
+
+// ----------------------- Helpers -----------------------
+
+integer Debug(string msg)
+{
+    if (gDebug)
+    {
+        key target = gDebugOwner;
+        if (target == NULL_KEY)
+        {
+            target = gOwner;
+        }
+        if (target == NULL_KEY)
+        {
+            target = llGetOwner();
+        }
+
+        if (target != NULL_KEY)
+        {
+            // PRIVATE IM, not local chat
+            llInstantMessage(target, "[DANCE DEBUG] " + msg);
+        }
+    }
+    return 0;
+}
+
+integer ScanAllAnims()
+{
+    gAllAnims = [];
+    integer count = llGetInventoryNumber(INVENTORY_ANIMATION);
+    integer i = 0;
+    while (i < count)
+    {
+        string name = llGetInventoryName(INVENTORY_ANIMATION, i);
+        if (name != "")
+        {
+            gAllAnims += [name];
+        }
+        i = i + 1;
+    }
+    Debug("Found " + (string)llGetListLength(gAllAnims) + " animation(s) in HUD prim.");
+    return 0;
+}
+
+integer ScanDanceNotecards()
+{
+    gDanceNotecards = [];
+    gDanceLabels    = [];
+
+    integer total = llGetInventoryNumber(INVENTORY_NOTECARD);
+    integer i = 0;
+    while (i < total)
+    {
+        string name  = llGetInventoryName(INVENTORY_NOTECARD, i);
+        string lower = llToLower(name);
+        if (llSubStringIndex(lower, "dance_") == 0)
+        {
+            gDanceNotecards += [name];
+
+            // label without "dance_"
+            string label = llGetSubString(name, 6, -1);
+            if (label == "")
+            {
+                label = name;
+            }
+            gDanceLabels += [label];
+        }
+        i = i + 1;
+    }
+
+    Debug("Found " + (string)llGetListLength(gDanceNotecards) + " dance_ notecard(s).");
+    return 0;
+}
+
+integer StopCurrentAnim()
+{
+    if (gLastAnim != "")
+    {
+        llStopAnimation(gLastAnim);
+        Debug("Stopped animation: " + gLastAnim);
+        gLastAnim = "";
+    }
+    return 0;
+}
+
+integer StopDance()
+{
+    gIsDancing   = FALSE;
+    gActiveIndex = -1;
+    llSetTimerEvent(0.0);
+
+    // Tell RezEngine to clean up any dance balls
+    if (gOwner != NULL_KEY)
+    {
+        llMessageLinked(LINK_SET, LM_REZ_ENGINE, "DANCE_STOP", gOwner);
+    }
+
+    StopCurrentAnim();
+    llOwnerSay("Dance: stopped.");
+    return 0;
+}
+
+integer PlayNextAnim()
+{
+    integer len = llGetListLength(gActiveAnimList);
+    if (!gIsDancing || len == 0)
+    {
+        return 0;
+    }
+
+    gActiveIndex = gActiveIndex + 1;
+    if (gActiveIndex >= len)
+    {
+        gActiveIndex = 0;
+    }
+
+    string anim = llList2String(gActiveAnimList, gActiveIndex);
+
+    StopCurrentAnim();
+    llStartAnimation(anim);
+    gLastAnim = anim;
+
+    Debug("Now playing: " + anim);
+
+    // Notify RezEngine of current animation so balls can sync
+    if (gOwner != NULL_KEY)
+    {
+        llMessageLinked(LINK_SET, LM_REZ_ENGINE, "DANCE_ANIM|" + anim, gOwner);
+    }
+
+    return 0;
+}
+
+integer BeginDanceCycle()
+{
+    integer len = llGetListLength(gActiveAnimList);
+    if (len == 0)
+    {
+        llOwnerSay("Dance: No animations found for this mode.");
+        return 0;
+    }
+
+    gIsDancing   = TRUE;
+    gActiveIndex = -1;
+    llSetTimerEvent(DANCE_INTERVAL);
+    llOwnerSay("Dance: starting with " + (string)len + " animation(s).");
+    PlayNextAnim();
+    return 0;
+}
+
+integer RequestDancePermissions()
+{
+    if (gHavePerms)
+    {
+        Debug("Already have permissions; starting dance cycle.");
+        BeginDanceCycle();
+        return 0;
+    }
+    Debug("Requesting animation permission from owner.");
+    llRequestPermissions(gOwner, PERMISSION_TRIGGER_ANIMATION);
+    return 0;
+}
+
+integer StartAllDances()
+{
+    ScanAllAnims();
+    if (llGetListLength(gAllAnims) == 0)
+    {
+        llOwnerSay("Dance: No animations in HUD to play.");
+        return 0;
+    }
+
+    gActiveAnimList = gAllAnims;
+    return RequestDancePermissions();
+}
+
+integer StartDancesFromCard(string cardName)
+{
+    if (llGetInventoryType(cardName) != INVENTORY_NOTECARD)
+    {
+        llOwnerSay("Dance: Notecard '" + cardName + "' not found.");
+        return 0;
+    }
+
+    // Begin async load
+    gLoadState    = 1;
+    gCurrentCard  = cardName;
+    gCurrentLine  = 0;
+    gTempAnimList = [];
+    gCurrentQuery = llGetNotecardLine(cardName, gCurrentLine);
+
+    llOwnerSay("Dance: Loading animations from card '" + cardName + "'.");
+    Debug("Starting notecard read for: " + cardName);
+    return 0;
+}
+
+// ----------------------- Menus -----------------------
+
+integer OpenRootMenu()
+{
+    if (gMenuHandle != -1)
+    {
+        llListenRemove(gMenuHandle);
+    }
+
+    // negative random channel
+    gMenuChan   = (integer)((llFrand(1000000.0) * -1.0) - 1.0);
+    gMenuHandle = llListen(gMenuChan, "", gOwner, "");
+    gMenuMode   = MENU_ROOT;
+    gCardPage   = 0;
+
+    list buttons = [
+        "Play All",
+        "Select Card",
+        "Stop",
+        "Cancel"
+    ];
+
+    llDialog(
+        gOwner,
+        "Dance options:",
+        buttons,
+        gMenuChan
+    );
+    return 0;
+}
+
+integer OpenCardMenu()
+{
+    integer len = llGetListLength(gDanceLabels);
+    if (len == 0)
+    {
+        llOwnerSay("Dance: No dance_ notecards found in HUD.");
+        return 0;
+    }
+
+    gMenuMode = MENU_CARD;
+
+    integer perPage   = DIALOG_PAGE_SIZE;
+    integer pageCount = (len + perPage - 1) / perPage;
+
+    if (gCardPage < 0)
+    {
+        gCardPage = 0;
+    }
+    if (gCardPage > pageCount - 1)
+    {
+        gCardPage = pageCount - 1;
+    }
+
+    integer start = gCardPage * perPage;
+    integer end   = start + perPage - 1;
+    if (end >= len)
+    {
+        end = len - 1;
+    }
+
+    list buttons = llList2List(gDanceLabels, start, end);
+
+    if (gCardPage > 0)
+    {
+        buttons += ["<< Prev"];
+    }
+    if (gCardPage < pageCount - 1)
+    {
+        buttons += ["Next >>"];
+    }
+    buttons += ["Cancel"];
+
+    string title = "Select a dance card (Page " +
+                   (string)(gCardPage + 1) + "/" +
+                   (string)pageCount + "):";
+
+    llDialog(
+        gOwner,
+        title,
+        buttons,
+        gMenuChan
+    );
+    return 0;
+}
+
+integer CloseMenu()
+{
+    if (gMenuHandle != -1)
+    {
+        llListenRemove(gMenuHandle);
+        gMenuHandle = -1;
+    }
+    gMenuChan = 0;
+    gMenuMode = MENU_ROOT;
+    gCardPage = 0;
+    return 0;
+}
+
+// ----------------------- State -----------------------
+
+default
+{
+    state_entry()
+    {
+        gOwner      = llGetOwner();
+        gDebugOwner = gOwner;
+        gDebug      = FALSE;
+        gHavePerms  = FALSE;
+        gIsDancing  = FALSE;
+        gLastAnim   = "";
+        llSetTimerEvent(0.0);
+
+        ScanAllAnims();
+        ScanDanceNotecards();
+
+        Debug("DanceEngine initialized.");
+    }
+
+    on_rez(integer p)
+    {
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        if (change & CHANGED_OWNER)
+        {
+            gOwner      = llGetOwner();
+            gDebugOwner = gOwner;
+            gHavePerms  = FALSE;
+            StopDance(); // sends DANCE_STOP and clears balls
+        }
+
+        if (change & CHANGED_INVENTORY)
+        {
+            ScanAllAnims();
+            ScanDanceNotecards();
+        }
+    }
+
+    run_time_permissions(integer perm)
+    {
+        if (perm & PERMISSION_TRIGGER_ANIMATION)
+        {
+            gHavePerms = TRUE;
+            Debug("Permissions granted.");
+            BeginDanceCycle();
+        }
+        else
+        {
+            gHavePerms = FALSE;
+            llOwnerSay("Dance: Cannot start without animation permission.");
+        }
+    }
+
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        // Global debug toggle from CORE
+        if (num == LM_DEBUG_MODE)
+        {
+            string s = llToLower(llStringTrim(str, STRING_TRIM));
+
+            // send debug IMs to whoever toggled debug, if provided
+            if (id != NULL_KEY)
+            {
+                gDebugOwner = id;
+                gOwner      = id;
+            }
+
+            if (s == "on")
+            {
+                gDebug = TRUE;
+                Debug("Debug mode ON.");
+            }
+            else if (s == "off")
+            {
+                Debug("Debug mode OFF.");
+                gDebug = FALSE;
+            }
+            return;
+        }
+
+        if (num != LM_DANCE_ENGINE)
+        {
+            return;
+        }
+
+        // Remember who pressed the Dance button
+        if (id != NULL_KEY)
+        {
+            gOwner = id;
+            if (gDebugOwner == NULL_KEY)
+            {
+                gDebugOwner = id;
+            }
+        }
+
+        if (str == "MENU")
+        {
+            Debug("Received MENU from CORE; opening root dance menu.");
+            OpenRootMenu();
+            return;
+        }
+
+        // Fallback legacy toggle if ever used
+        if (str == "TOGGLE")
+        {
+            if (gIsDancing)
+            {
+                StopDance();
+            }
+            else
+            {
+                StartAllDances();
+            }
+            return;
+        }
+    }
+
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel != gMenuChan)
+        {
+            return;
+        }
+        if (id != gOwner)
+        {
+            return;
+        }
+
+        msg = llStringTrim(msg, STRING_TRIM);
+
+        if (msg == "Cancel")
+        {
+            CloseMenu();
+            return;
+        }
+
+        if (gMenuMode == MENU_ROOT)
+        {
+            if (msg == "Play All")
+            {
+                CloseMenu();
+                StopDance();
+                StartAllDances();
+            }
+            else if (msg == "Select Card")
+            {
+                OpenCardMenu();
+            }
+            else if (msg == "Stop")
+            {
+                CloseMenu();
+                StopDance();
+            }
+            return;
+        }
+
+        if (gMenuMode == MENU_CARD)
+        {
+            if (msg == "<< Prev")
+            {
+                gCardPage = gCardPage - 1;
+                OpenCardMenu();
+                return;
+            }
+
+            if (msg == "Next >>")
+            {
+                gCardPage = gCardPage + 1;
+                OpenCardMenu();
+                return;
+            }
+
+            if (msg == "Cancel")
+            {
+                CloseMenu();
+                return;
+            }
+
+            integer idx = llListFindList(gDanceLabels, [msg]);
+            if (idx == -1)
+            {
+                llOwnerSay("Dance: Unknown card selection: " + msg);
+                return;
+            }
+
+            string cardName = llList2String(gDanceNotecards, idx);
+            CloseMenu();
+            StopDance();
+            StartDancesFromCard(cardName);
+            return;
+        }
+    }
+
+    timer()
+    {
+        if (gIsDancing)
+        {
+            PlayNextAnim();
+        }
+        else
+        {
+            llSetTimerEvent(0.0);
+        }
+    }
+
+    dataserver(key query_id, string data)
+    {
+        if (query_id != gCurrentQuery)
+        {
+            return;
+        }
+        if (gLoadState != 1)
+        {
+            return; // not reading a dance card
+        }
+
+        if (data == EOF)
+        {
+            gLoadState = 0;
+            Debug(
+                "Finished reading dance card '" + gCurrentCard + "' with " +
+                (string)llGetListLength(gTempAnimList) + " valid animation(s)."
+            );
+
+            if (llGetListLength(gTempAnimList) == 0)
+            {
+                llOwnerSay(
+                    "Dance: No valid animations found in card '" +
+                    gCurrentCard + "'."
+                );
+                return;
+            }
+
+            gActiveAnimList = gTempAnimList;
+            RequestDancePermissions();
+            return;
+        }
+
+        string line = llStringTrim(data, STRING_TRIM);
+        if (line != "" && llGetSubString(line, 0, 0) != "#")
+        {
+            string animName = line;
+            if (llGetInventoryType(animName) == INVENTORY_ANIMATION)
+            {
+                gTempAnimList += [animName];
+                Debug("Added card anim: " + animName);
+            }
+            else
+            {
+                Debug(
+                    "Line '" + animName +
+                    "' not found as animation in HUD; skipping."
+                );
+            }
+        }
+
+        gCurrentLine = gCurrentLine + 1;
+        gCurrentQuery = llGetNotecardLine(gCurrentCard, gCurrentLine);
+    }
+}
