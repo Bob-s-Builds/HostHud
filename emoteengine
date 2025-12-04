@@ -1,0 +1,567 @@
+// -----------------------------------------------------------------------------
+// EMOTEENGINE.LSL — Menu-based emotes + legacy E1/E2 + @NAME@ targeting + debug
+// -----------------------------------------------------------------------------
+
+integer LM_EMOTE_ENGINE = 1005;   // must match CORE
+integer LM_DEBUG_MODE   = 1012;   // global debug toggle from CORE
+integer LM_DUMP_BRIDGE = 1013;
+
+integer CHAT_CHANNEL    = 0;      // public chat channel
+string  EMOTE_PREFIX    = "/me ";
+
+integer DIALOG_MODE_NONE   = 0;
+integer DIALOG_MODE_EMOTES = 1;
+integer DIALOG_MODE_TARGET = 2;
+
+integer gDebugMode      = FALSE;
+key     gDebugOwnerID   = NULL_KEY;
+
+key     gOwner;
+
+// Shared dialog state
+integer gDialogChan     = 0;
+integer gDialogListen   = -1;
+integer gDialogMode     = DIALOG_MODE_NONE;
+
+// Emote menu data
+integer gEmotePage      = 0;
+list    gEmoteLabels    = [];
+list    gEmoteTexts     = [];
+
+// Target menu data (for @NAME@)
+integer gTargetPage     = 0;
+list    gTargetNames    = [];
+list    gTargetKeys     = [];
+
+// Pending emote template when waiting for a target
+string  gPendingEmoteTemplate = "";  // includes /me and @NAME@ if present
+
+string Trim(string s)
+{
+    return llStringTrim(s, STRING_TRIM);
+}
+
+integer CloseDialog()
+{
+    if (gDialogListen != -1)
+    {
+        llListenRemove(gDialogListen);
+        gDialogListen = -1;
+    }
+    llSetTimerEvent(0.0);
+    gDialogChan = 0;
+    return 0;
+}
+
+integer DoEmote(string finalEmote)
+{
+    if (finalEmote == "") return 0;
+
+    key target = gDebugOwnerID;
+    if (target == NULL_KEY)
+    {
+        target = gOwner;
+    }
+
+    if (gDebugMode)
+    {
+        // In debug mode, whisper to HUD owner only
+        llRegionSayTo(target, 0, finalEmote);
+    }
+    else
+    {
+        // Normal mode: public emote
+        llSay(CHAT_CHANNEL, finalEmote);
+    }
+    return 0;
+}
+
+// Open the emote-choice dialog (from EMOTES payload)
+integer OpenEmoteDialog()
+{
+    integer count = llGetListLength(gEmoteLabels);
+    if (count == 0)
+    {
+        return 0;
+    }
+
+    list buttons;
+    string title;
+
+    if (count <= 11)
+    {
+        buttons = gEmoteLabels + ["Cancel"];
+        title   = "Select an emote:";
+    }
+    else
+    {
+        integer perPage   = 9;
+        integer pageCount = (count + perPage - 1) / perPage;
+
+        if (gEmotePage < 0) gEmotePage = 0;
+        if (gEmotePage > pageCount - 1) gEmotePage = pageCount - 1;
+
+        integer start = gEmotePage * perPage;
+        integer end   = start + perPage - 1;
+        if (end >= count) end = count - 1;
+
+        buttons = llList2List(gEmoteLabels, start, end);
+
+        if (gEmotePage > 0)
+        {
+            buttons += ["<< Prev"];
+        }
+        if (gEmotePage < pageCount - 1)
+        {
+            buttons += ["Next >>"];
+        }
+        buttons += ["Cancel"];
+
+        title = "Select an emote (Page " +
+                 (string)(gEmotePage + 1) + "/" +
+                 (string)pageCount + "):";
+    }
+
+    CloseDialog(); // reset any previous dialog
+    gDialogMode   = DIALOG_MODE_EMOTES;
+    gDialogChan   = (integer)((llFrand(1000000.0) * -1.0) - 1.0);
+    gDialogListen = llListen(gDialogChan, "", gOwner, "");
+
+    llDialog(gOwner, title, buttons, gDialogChan);
+    llSetTimerEvent(30.0);
+    return 0;
+}
+
+// Open the target-choice dialog (for @NAME@ emotes)
+integer OpenTargetDialog()
+{
+    integer count = llGetListLength(gTargetNames);
+    if (count == 0)
+    {
+        return 0;
+    }
+
+    list buttons;
+    string title;
+
+    if (count <= 11)
+    {
+        buttons = gTargetNames + ["Cancel"];
+        title   = "Who do you want to target?";
+    }
+    else
+    {
+        integer perPage   = 9;
+        integer pageCount = (count + perPage - 1) / perPage;
+
+        if (gTargetPage < 0) gTargetPage = 0;
+        if (gTargetPage > pageCount - 1) gTargetPage = pageCount - 1;
+
+        integer start = gTargetPage * perPage;
+        integer end   = start + perPage - 1;
+        if (end >= count) end = count - 1;
+
+        buttons = llList2List(gTargetNames, start, end);
+
+        if (gTargetPage > 0)
+        {
+            buttons += ["<< Prev"];
+        }
+        if (gTargetPage < pageCount - 1)
+        {
+            buttons += ["Next >>"];
+        }
+        buttons += ["Cancel"];
+
+        title = "Who do you want to target? (Page " +
+                 (string)(gTargetPage + 1) + "/" +
+                 (string)pageCount + "):";
+    }
+
+    CloseDialog(); // reset any previous dialog
+    gDialogMode   = DIALOG_MODE_TARGET;
+    gDialogChan   = (integer)((llFrand(1000000.0) * -1.0) - 1.0);
+    gDialogListen = llListen(gDialogChan, "", gOwner, "");
+
+    llDialog(gOwner, title, buttons, gDialogChan);
+    llSetTimerEvent(30.0);
+    return 0;
+}
+
+// Start the target-selection process for an emote with @NAME@
+integer StartTargetSelection(string templateEmote)
+{
+    gPendingEmoteTemplate = templateEmote;
+
+    // Scan nearby avatars (96m radius)
+    llSensor("", NULL_KEY, AGENT, 96.0, PI);
+    return 0;
+}
+
+// Replace all @NAME@ in template with the chosen avatar's name
+string SubstituteName(string template, string targetName)
+{
+    list parts = llParseString2List(template, ["@NAME@"], []);
+    return llDumpList2String(parts, targetName);
+}
+
+// Handle "raw" emote text from notecard (either E1/E2 or menu)
+integer StartEmoteWithOptionalTarget(string rawText)
+{
+    string cleaned  = Trim(rawText);
+    if (cleaned == "") return 0;
+
+    string template = EMOTE_PREFIX + cleaned;
+
+    if (llSubStringIndex(cleaned, "@NAME@") != -1)
+    {
+        // Needs a target
+        StartTargetSelection(template);
+    }
+    else
+    {
+        // No target placeholder, just fire
+        DoEmote(template);
+    }
+    return 0;
+}
+
+default
+{
+    state_entry()
+    {
+        gOwner        = llGetOwner();
+        gDebugMode    = FALSE;
+        gDebugOwnerID = NULL_KEY;
+        gDialogChan   = 0;
+        gDialogListen = -1;
+        gDialogMode   = DIALOG_MODE_NONE;
+
+        gEmotePage      = 0;
+        gEmoteLabels    = [];
+        gEmoteTexts     = [];
+
+        gTargetPage     = 0;
+        gTargetNames    = [];
+        gTargetKeys     = [];
+
+        gPendingEmoteTemplate = "";
+
+        llSetText("", <1.0, 1.0, 1.0>, 1.0);
+    }
+
+    on_rez(integer sp)
+    {
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        if (change & CHANGED_OWNER)
+        {
+            gOwner = llGetOwner();
+        }
+    }
+
+    // Handle debug mode + emote payloads / direct emotes
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        // Global debug on/off from CORE
+        if (num == LM_DEBUG_MODE)
+        {
+            string s = llToLower(Trim(str));
+            if (s == "on")
+            {
+                gDebugMode    = TRUE;
+                gDebugOwnerID = id;
+            }
+            else if (s == "off")
+            {
+                gDebugMode    = FALSE;
+                gDebugOwnerID = id;
+            }
+            return;
+        }
+
+        if (num != LM_EMOTE_ENGINE) return;
+        if (str == "") return;
+
+        // Payload mode: "EMOTES|Label=text|Label2=text2|..."
+        if (llSubStringIndex(str, "EMOTES|") == 0)
+        {
+            list parts = llParseString2List(str, ["|"], []);
+            integer len = llGetListLength(parts);
+            if (len <= 1) return;
+
+            gEmoteLabels = [];
+            gEmoteTexts  = [];
+            gEmotePage   = 0;
+
+            integer i = 1;
+            while (i < len)
+            {
+                string item = llList2String(parts, i);
+                integer eq  = llSubStringIndex(item, "=");
+                if (eq > 0)
+                {
+                    string label = Trim(llGetSubString(item, 0, eq - 1));
+                    string text  = "";
+                    integer last = llStringLength(item) - 1;
+                    if (eq + 1 <= last)
+                    {
+                        text = Trim(llGetSubString(item, eq + 1, -1));
+                    }
+
+                    if (label != "" && text != "")
+                    {
+                        // Ensure label <= 24 chars
+                        if (llStringLength(label) > 24)
+                        {
+                            label = llGetSubString(label, 0, 23);
+                        }
+                        gEmoteLabels += [label];
+                        gEmoteTexts  += [text];
+                    }
+                }
+                i = i + 1;
+            }
+
+            if (llGetListLength(gEmoteLabels) == 0)
+            {
+                return;
+            }
+
+            OpenEmoteDialog();
+            return;
+        }
+
+        // Direct emote text mode (legacy E1/E2 style).
+        StartEmoteWithOptionalTarget(str);
+    }
+
+    // Dialog responses for emote menu and target menu
+    listen(integer channel, string fromName, key id, string msg)
+    {
+        if (channel != gDialogChan) return;
+        if (id != gOwner)          return;
+
+        string choice = Trim(msg);
+
+        // ---------------- EMOTE MENU MODE ----------------
+        if (gDialogMode == DIALOG_MODE_EMOTES)
+        {
+            if (choice == "Cancel")
+            {
+                CloseDialog();
+                gDialogMode = DIALOG_MODE_NONE;
+                return;
+            }
+            if (choice == "<< Prev")
+            {
+                gEmotePage--;
+                OpenEmoteDialog();
+                return;
+            }
+            if (choice == "Next >>")
+            {
+                gEmotePage++;
+                OpenEmoteDialog();
+                return;
+            }
+
+            // Actual emote chosen
+            integer idx = llListFindList(gEmoteLabels, [choice]);
+            if (idx == -1)
+            {
+                CloseDialog();
+                gDialogMode = DIALOG_MODE_NONE;
+                return;
+            }
+
+            string text = llList2String(gEmoteTexts, idx);
+            text = Trim(text);
+            CloseDialog();
+            gDialogMode = DIALOG_MODE_NONE;
+
+            if (text == "") return;
+
+            StartEmoteWithOptionalTarget(text);
+            return;
+        }
+
+// ---------------- TARGET MENU MODE ----------------
+if (gDialogMode == DIALOG_MODE_TARGET)
+{
+    if (choice == "Cancel")
+    {
+        CloseDialog();
+        gDialogMode           = DIALOG_MODE_NONE;
+        gPendingEmoteTemplate = "";
+        gTargetNames          = [];
+        gTargetKeys           = [];
+        return;
+    }
+    if (choice == "<< Prev")
+    {
+        gTargetPage--;
+        OpenTargetDialog();
+        return;
+    }
+    if (choice == "Next >>")
+    {
+        gTargetPage++;
+        OpenTargetDialog();
+        return;
+    }
+
+    // Target chosen
+    integer idx2 = llListFindList(gTargetNames, [choice]);
+    if (idx2 == -1)
+    {
+        CloseDialog();
+        gDialogMode           = DIALOG_MODE_NONE;
+        gPendingEmoteTemplate = "";
+        gTargetNames          = [];
+        gTargetKeys           = [];
+        return;
+    }
+
+    string chosenName = llList2String(gTargetNames, idx2);
+    key    chosenKey  = llList2Key(gTargetKeys, idx2);
+
+    // Prefer the current name from SL in case it's changed
+    string liveName = llKey2Name(chosenKey);
+    if (liveName != "")
+    {
+        chosenName = liveName;
+    }
+
+    // NEW: truncate to first word before the space
+    integer spacePos = llSubStringIndex(chosenName, " ");
+    if (spacePos != -1)
+    {
+        chosenName = llGetSubString(chosenName, 0, spacePos - 1);
+    }
+
+    CloseDialog();
+    gDialogMode = DIALOG_MODE_NONE;
+
+    if (gPendingEmoteTemplate != "")
+    {
+        string finalEmote = SubstituteName(gPendingEmoteTemplate, chosenName);
+        gPendingEmoteTemplate = "";
+        gTargetNames          = [];
+        gTargetKeys           = [];
+        DoEmote(finalEmote);
+    }
+    return;
+}
+
+
+            // Target chosen
+            integer idx2 = llListFindList(gTargetNames, [choice]);
+            if (idx2 == -1)
+            {
+                CloseDialog();
+                gDialogMode           = DIALOG_MODE_NONE;
+                gPendingEmoteTemplate = "";
+                gTargetNames          = [];
+                gTargetKeys           = [];
+                return;
+            }
+
+            string chosenName = llList2String(gTargetNames, idx2);
+            key    chosenKey  = llList2Key(gTargetKeys, idx2);
+
+            // Prefer the current name from SL in case it's changed
+            string liveName = llKey2Name(chosenKey);
+            if (liveName != "") chosenName = liveName;
+
+            CloseDialog();
+            gDialogMode = DIALOG_MODE_NONE;
+
+            if (gPendingEmoteTemplate != "")
+            {
+                string finalEmote = SubstituteName(gPendingEmoteTemplate, chosenName);
+                gPendingEmoteTemplate = "";
+                gTargetNames          = [];
+                gTargetKeys           = [];
+                DoEmote(finalEmote);
+            }
+            return;
+        }
+    
+
+    // Sensor results when starting target selection for @NAME@
+    sensor(integer num_detected)
+    {
+        if (gPendingEmoteTemplate == "")
+        {
+            return;
+        }
+
+        gTargetNames = [];
+        gTargetKeys  = [];
+        gTargetPage  = 0;
+
+        integer i = 0;
+        while (i < num_detected)
+        {
+            key    detKey  = llDetectedKey(i);
+            string detName = llDetectedName(i);
+
+            if (detKey != gOwner && detName != "")
+            {
+                // Dialog button label must be <= 24 chars
+                if (llStringLength(detName) > 24)
+                {
+                    detName = llGetSubString(detName, 0, 23);
+                }
+                gTargetNames += [detName];
+                gTargetKeys  += [detKey];
+            }
+
+            i = i + 1;
+        }
+
+        if (llGetListLength(gTargetNames) == 0)
+        {
+            key target = gDebugOwnerID;
+            if (target == NULL_KEY) target = gOwner;
+            llRegionSayTo(target, 0,
+                "No nearby avatars to target for that emote.");
+            gPendingEmoteTemplate = "";
+            gDialogMode           = DIALOG_MODE_NONE;
+            return;
+        }
+
+        OpenTargetDialog();
+    }
+
+    no_sensor()
+    {
+        // No avatars detected at all
+        if (gPendingEmoteTemplate != "")
+        {
+            key target = gDebugOwnerID;
+            if (target == NULL_KEY) target = gOwner;
+            llRegionSayTo(target, 0,
+                "No nearby avatars to target for that emote.");
+            gPendingEmoteTemplate = "";
+            gDialogMode           = DIALOG_MODE_NONE;
+        }
+    }
+
+    timer()
+    {
+        // Dialog timeout
+        if (gDialogChan != 0)
+        {
+            CloseDialog();
+            gDialogMode           = DIALOG_MODE_NONE;
+            gPendingEmoteTemplate = "";
+            gTargetNames          = [];
+            gTargetKeys           = [];
+        }
+    }
+}
