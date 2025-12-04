@@ -1,0 +1,520 @@
+// -----------------------------------------------------------------------------
+// RADARENGINE.LSL - radar with hidden greets + blacklist + 2h cooldown
+// -----------------------------------------------------------------------------
+//
+// - Controlled by CORE via LM_RADAR_ENGINE "MENU" (id = host).
+// - CORE passes config lines via LM_CONFIG_PASS:
+//      "greet|<text>"
+//      "greet_blacklist|<name1,name2,...>"
+// - Behavior:
+//      * On startup: Radar OFF
+//      * Greet is a hidden feature: no explicit status text
+//      * Greet only runs if greet= exists and is non-empty
+//      * User can run radar with or without greet if greet is available
+//      * If no greet= or it's blank, menu shows only basic radar options
+//      * Greets have 2h per-avatar cooldown
+//      * Blacklist prevents greets for matching names
+//
+// Greet text supports multiple variants in a single line:
+//      greet=Welcome @NAME@!||Hi hi @NAME@!||Glad you're here, @NAME@!
+//   or:
+//      greet=Welcome @NAME@!;Hi hi @NAME@!;Glad you're here, @NAME@!
+//
+// Greet text can contain simple tokens (after variant is chosen):
+//      @NAME@   -> full avatar name
+//      @FIRST@  -> first name
+//      @LAST@   -> last name
+// -----------------------------------------------------------------------------
+
+integer LM_RADAR_ENGINE = 1006;
+integer LM_CONFIG_PASS  = 1008;
+integer LM_SHOUT_ENGINE = 1001;
+integer LM_DUMP_BRIDGE  = 1013; // reserved if you want to bridge radar data
+
+string  CFG_GREET           = "greet";
+string  CFG_GREET_BLACKLIST = "greet_blacklist";
+
+float   SENSOR_RANGE   = 20.0;
+float   SENSOR_REPEAT  = 5.0;
+integer AVATAR_TYPE    = AGENT;
+integer GREET_COOLDOWN = 7200; // 2 hours in seconds
+
+// Menu
+integer RADAR_MENU_CHAN   = -99002;
+integer gMenuHandle       = -1;
+
+// State
+key     gOwner           = NULL_KEY;
+integer gRadarOn         = FALSE;  // starts OFF
+integer gGreetAvailable  = FALSE;  // TRUE if greet template exists and non-empty
+integer gGreetEnabled    = FALSE;  // user-chosen toggle; only works if available
+string  gGreetTemplate   = "";     // raw from greet=
+list    gGreetBlacklist  = [];     // lowercased names / patterns
+
+// Cooldown memory
+list    gGreetedKeys  = []; // [key, key, ...]
+list    gGreetedTimes = []; // [int, int, ...], same indices as keys
+
+// ---------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------
+
+string Trim(string s)
+{
+    return llStringTrim(s, STRING_TRIM);
+}
+
+integer InBlacklist(string name)
+{
+    string lname = llToLower(Trim(name));
+    integer len  = llGetListLength(gGreetBlacklist);
+    integer i;
+
+    for (i = 0; i < len; ++i)
+    {
+        string pat = llList2String(gGreetBlacklist, i);
+        if (pat == "") jump continue_loop;
+
+        // match either exact or as a substring
+        if (lname == pat || llSubStringIndex(lname, pat) != -1)
+        {
+            return TRUE;
+        }
+
+        @continue_loop;
+    }
+    return FALSE;
+}
+
+// Simple "replace all" helper
+string ReplaceAll(string src, string find, string rep)
+{
+    integer flen = llStringLength(find);
+    if (flen <= 0) return src;
+
+    integer pos = llSubStringIndex(src, find);
+    while (pos != -1)
+    {
+        string before = "";
+        string after  = "";
+
+        if (pos > 0)
+        {
+            before = llGetSubString(src, 0, pos - 1);
+        }
+        integer endPos = pos + flen;
+        if (endPos <= llStringLength(src) - 1)
+        {
+            after = llGetSubString(src, endPos, -1);
+        }
+
+        src = before + rep + after;
+        pos = llSubStringIndex(src, find);
+    }
+    return src;
+}
+
+// Pick ONE random variant from the raw greet template.
+// Supports separators "||" or ";" (or both).
+string PickRandomGreetVariant(string raw)
+{
+    // Split on both delimiters
+    list parts = llParseString2List(raw, ["||", ";"], []);
+
+    list clean = [];
+    integer len = llGetListLength(parts);
+    integer i;
+    for (i = 0; i < len; ++i)
+    {
+        string s = Trim(llList2String(parts, i));
+        if (s != "")
+        {
+            clean += [s];
+        }
+    }
+
+    len = llGetListLength(clean);
+    if (len == 0) return "";
+    if (len == 1) return llList2String(clean, 0);
+
+    integer idx = (integer)llFrand((float)len);
+    return llList2String(clean, idx);
+}
+
+// Build a greet message from template and avatar name
+string BuildGreetMessage(key avKey)
+{
+    if (gGreetTemplate == "") return "";
+
+    // 1) Pick a single variant from the template
+    string variant = PickRandomGreetVariant(gGreetTemplate);
+    if (variant == "") return "";
+
+    string msg  = variant;
+    string name = llKey2Name(avKey);
+
+    list nameParts = llParseString2List(name, [" "], []);
+    string first = llList2String(nameParts, 0);
+    string last  = "";
+    if (llGetListLength(nameParts) > 1)
+    {
+        last = llDumpList2String(llList2List(nameParts, 1, -1), " ");
+    }
+
+    // 2) Replace tokens only in that chosen variant
+    msg = ReplaceAll(msg, "@NAME@",  name);
+    msg = ReplaceAll(msg, "@FIRST@", first);
+    msg = ReplaceAll(msg, "@LAST@",  last);
+
+    return msg;
+}
+
+// Check cooldown and record this greet if allowed
+integer CanGreetAndMark(key avKey)
+{
+    float now = llGetUnixTime();
+    integer idx = llListFindList(gGreetedKeys, [avKey]);
+
+    if (idx != -1)
+    {
+        integer last = llList2Integer(gGreetedTimes, idx);
+        if ((integer)now - last < GREET_COOLDOWN)
+        {
+            return FALSE;
+        }
+
+        gGreetedTimes = llListReplaceList(gGreetedTimes, [(integer)now], idx, idx);
+    }
+    else
+    {
+        gGreetedKeys  += [avKey];
+        gGreetedTimes += [(integer)now];
+    }
+    return TRUE;
+}
+
+// Start/stop radar sensor
+integer StartRadar()
+{
+    if (!gRadarOn)
+    {
+        gRadarOn = TRUE;
+        llSensorRepeat("", NULL_KEY, AVATAR_TYPE, SENSOR_RANGE, PI, SENSOR_REPEAT);
+        llRegionSayTo(gOwner, 0, "[Radar] Radar ON.");
+    }
+    return 0;
+}
+
+integer StopRadar()
+{
+    if (gRadarOn)
+    {
+        gRadarOn      = FALSE;
+        gGreetEnabled = FALSE; // when radar is turned off, greet default back off
+        llSensorRemove();
+        llRegionSayTo(gOwner, 0, "[Radar] Radar OFF.");
+    }
+    return 0;
+}
+
+// Open the radar menu
+// - If no greet template: only show basic Radar ON/OFF + Close
+// - If greet template exists: allow Radar ON (no greet) and Radar+Greet ON
+integer OpenRadarMenu()
+{
+    if (gOwner == NULL_KEY)
+    {
+        gOwner = llGetOwner();
+    }
+
+    if (gMenuHandle != -1)
+    {
+        llListenRemove(gMenuHandle);
+        gMenuHandle = -1;
+    }
+
+    RADAR_MENU_CHAN = (integer)((llFrand(1000000.0) * -1.0) - 1.0);
+    gMenuHandle     = llListen(RADAR_MENU_CHAN, "", gOwner, "");
+
+    list buttons = [];
+
+    if (!gRadarOn)
+    {
+        // Radar currently OFF
+        buttons += ["Radar ON"];              // radar without greet
+        if (gGreetAvailable)
+        {
+            buttons += ["Radar+Greet ON"];    // radar with greet
+        }
+    }
+    else
+    {
+        // Radar currently ON
+        buttons += ["Radar OFF"];
+
+        if (gGreetAvailable)
+        {
+            if (gGreetEnabled)
+            {
+                // Currently greeting; allow turning greet off
+                buttons += ["Radar (no greet)"];
+            }
+            else
+            {
+                // Currently no greet; allow enabling greet
+                buttons += ["Radar+Greet ON"];
+            }
+        }
+    }
+
+    buttons += ["Close"];
+
+    string status = "Radar menu\nRadar: ";
+    if (gRadarOn)
+    {
+        status += "ON";
+    }
+    else
+    {
+        status += "OFF";
+    }
+
+    // No explicit greet status text (keeps greet "secret-ish")
+    llDialog(gOwner, status, buttons, RADAR_MENU_CHAN);
+    return 0;
+}
+
+// Handle config from CORE
+integer HandleConfigPass(string str)
+{
+    list parts = llParseString2List(str, ["|"], []);
+    if (llGetListLength(parts) < 2) return 0;
+
+    string cfgKeyLower = llToLower(llList2String(parts, 0));
+    string val         = llList2String(parts, 1);
+
+    // Hidden greet template (can contain multiple variants)
+    if (cfgKeyLower == llToLower(CFG_GREET))
+    {
+        gGreetTemplate = Trim(val);
+
+        if (gGreetTemplate != "")
+        {
+            // Greet is AVAILABLE, but stays OFF until user chooses Radar+Greet
+            gGreetAvailable = TRUE;
+            gGreetEnabled   = FALSE;
+        }
+        else
+        {
+            // No usable greet
+            gGreetAvailable = FALSE;
+            gGreetEnabled   = FALSE;
+        }
+        return 0;
+    }
+
+    // Blacklist for greet
+    if (cfgKeyLower == llToLower(CFG_GREET_BLACKLIST))
+    {
+        gGreetBlacklist = [];
+        list raw = llParseString2List(val, [","], []);
+        integer i;
+        integer len = llGetListLength(raw);
+        for (i = 0; i < len; ++i)
+        {
+            string entry = llToLower(Trim(llList2String(raw, i)));
+            if (entry != "")
+            {
+                gGreetBlacklist += [entry];
+            }
+        }
+        return 0;
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------
+
+default
+{
+    state_entry()
+    {
+        gOwner          = llGetOwner();
+        gRadarOn        = FALSE;  // Radar OFF on start
+        gGreetAvailable = FALSE;  // until a non-empty greet= arrives
+        gGreetEnabled   = FALSE;  // user-toggle off by default
+        gGreetTemplate  = "";
+        gGreetBlacklist = [];
+
+        gGreetedKeys   = [];
+        gGreetedTimes  = [];
+
+        if (gMenuHandle != -1)
+        {
+            llListenRemove(gMenuHandle);
+            gMenuHandle = -1;
+        }
+
+        llSensorRemove();
+    }
+
+    on_rez(integer start_param)
+    {
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        if (change & CHANGED_OWNER)
+        {
+            gOwner          = llGetOwner();
+            // On owner change keep radar and greet off until config comes again
+            gRadarOn        = FALSE;
+            gGreetAvailable = FALSE;
+            gGreetEnabled   = FALSE;
+            gGreetTemplate  = "";
+            gGreetBlacklist = [];
+            gGreetedKeys    = [];
+            gGreetedTimes   = [];
+            llSensorRemove();
+        }
+    }
+
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        // Config pass from CORE
+        if (num == LM_CONFIG_PASS)
+        {
+            HandleConfigPass(str);
+            return;
+        }
+
+        // Menu control from CORE
+        if (num == LM_RADAR_ENGINE)
+        {
+            // Remember host who clicked the Radar button
+            if (id != NULL_KEY)
+            {
+                gOwner = id;
+            }
+
+            string msg = Trim(str);
+
+            if (msg == "MENU")
+            {
+                OpenRadarMenu();
+                return;
+            }
+
+            // Optional direct commands if ever needed
+            if (msg == "RADAR_ON")
+            {
+                StartRadar();
+                return;
+            }
+            if (msg == "RADAR_OFF")
+            {
+                StopRadar();
+                return;
+            }
+        }
+    }
+
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel != RADAR_MENU_CHAN) return;
+        if (id != gOwner)               return;
+
+        msg = Trim(msg);
+
+        if (msg == "Close")
+        {
+            if (gMenuHandle != -1)
+            {
+                llListenRemove(gMenuHandle);
+                gMenuHandle = -1;
+            }
+            return;
+        }
+
+        if (msg == "Radar ON")
+        {
+            gGreetEnabled = FALSE; // explicit "no greet" mode
+            StartRadar();
+            OpenRadarMenu();
+            return;
+        }
+
+        if (msg == "Radar+Greet ON")
+        {
+            if (gGreetAvailable && gGreetTemplate != "")
+            {
+                gGreetEnabled = TRUE;
+            }
+            else
+            {
+                gGreetEnabled = FALSE;
+            }
+            StartRadar();
+            OpenRadarMenu();
+            return;
+        }
+
+        if (msg == "Radar (no greet)")
+        {
+            gGreetEnabled = FALSE;
+            StartRadar(); // radar is already on, but harmless
+            OpenRadarMenu();
+            return;
+        }
+
+        if (msg == "Radar OFF")
+        {
+            StopRadar();
+            OpenRadarMenu();
+            return;
+        }
+    }
+
+    sensor(integer num_detected)
+    {
+        if (!gRadarOn) return;
+
+        integer i;
+        for (i = 0; i < num_detected; ++i)
+        {
+            key    avKey = llDetectedKey(i);
+            string name  = llDetectedName(i);
+
+            // Skip owner
+            if (avKey == gOwner)        jump next_avatar;
+            if (avKey == llGetOwner())  jump next_avatar;
+
+            // Hidden greet: only proceed if available, enabled, and we have a template
+            if (!gGreetAvailable || !gGreetEnabled || gGreetTemplate == "") jump next_avatar;
+
+            // Blacklist check
+            if (InBlacklist(name)) jump next_avatar;
+
+            // Cooldown check
+            if (!CanGreetAndMark(avKey)) jump next_avatar;
+
+            // Build greet and send via ShoutEngine
+            string greetMsg = BuildGreetMessage(avKey);
+            if (greetMsg != "")
+            {
+                llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, greetMsg, NULL_KEY);
+            }
+
+            @next_avatar;
+        }
+    }
+
+    no_sensor()
+    {
+        // nothing special; radar just didn't detect anyone this tick
+    }
+}
