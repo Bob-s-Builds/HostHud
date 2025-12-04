@@ -1,0 +1,454 @@
+// =========================================================
+// DanceBall_Master.lsl - Multi-avatar click-to-dance ball
+// Single ball, multiple dancer-slot scripts.
+// Guests DO NOT sit or move; they stay where they are.
+// =========================================================
+//
+// Rezzed by RezEngine with start_param = private channel.
+//
+// Listens on that channel for (from HUD/RezEngine/dance engine):
+//   "DANCE_ANIM|<animName>"
+//   "MODE|FOLLOW"
+//   "MODE|STAY"
+//   "DANCE_STOP"
+//   "CLEANUP"
+//
+// Uses multiple DanceBall_Slot scripts in the SAME object.
+// Each slot script controls 1 avatar.
+//
+// Shutdown behavior:
+//   - On DANCE_STOP / CLEANUP / host too far / host leaves region:
+//       * Tell all slots to stop dancers (LM_STOP_ALL).
+//       * Wait until all slots report free (LM_SLOT_FREE).
+//       * THEN delete the ball (llDie).
+//
+// Guests:
+//   - Click to join/leave their own slot only.
+//   - Cannot trigger shutdown or delete the ball.
+// =========================================================
+
+integer LM_ANIM_UPDATE = 2001;
+integer LM_ASSIGN_SLOT = 2002;
+integer LM_STOP_ALL    = 2003;
+integer LM_SLOT_FREE   = 2004;
+
+integer gCommChan   = 0;
+integer gListen     = -1;
+
+key     gHost       = NULL_KEY;
+integer gFollowMode = FALSE;
+
+string  gCurrentAnim   = "";
+integer gDebug         = TRUE;
+
+float   gMaxDistance   = 100.0;
+float   gCheckInterval = 2.0;
+
+integer MAX_SLOTS      = 20; // you want 20 slots
+
+list    gSlotAvs;            // avatar key per slot (NULL_KEY = free)
+
+integer gShuttingDown  = FALSE;
+
+// ------------------------ Helpers ------------------------
+
+integer Debug(string msg)
+{
+    if (gDebug && gHost != NULL_KEY)
+    {
+        llRegionSayTo(gHost, 0, "[DANCEBALL MASTER] " + msg);
+    }
+    return 0;
+}
+
+integer InitSlots()
+{
+    integer idx = 0;
+    gSlotAvs = [];
+    while (idx < MAX_SLOTS)
+    {
+        gSlotAvs += [NULL_KEY];
+        idx++;
+    }
+    return 0;
+}
+
+integer SetSlotAvatar(integer idx, key av)
+{
+    if (idx < 0)
+    {
+        return 0;
+    }
+    if (idx >= MAX_SLOTS)
+    {
+        return 0;
+    }
+
+    gSlotAvs = llListReplaceList(gSlotAvs, [av], idx, idx);
+    return 0;
+}
+
+integer FindAvatarSlot(key av)
+{
+    integer len = llGetListLength(gSlotAvs);
+    integer idx = 0;
+    while (idx < len)
+    {
+        key k = llList2Key(gSlotAvs, idx);
+        if (k == av)
+        {
+            return idx;
+        }
+        idx++;
+    }
+    return -1;
+}
+
+integer FindFreeSlot()
+{
+    integer len = llGetListLength(gSlotAvs);
+    integer idx = 0;
+    while (idx < len)
+    {
+        key k = llList2Key(gSlotAvs, idx);
+        if (k == NULL_KEY)
+        {
+            return idx;
+        }
+        idx++;
+    }
+    return -1;
+}
+
+integer AllSlotsFree()
+{
+    integer len = llGetListLength(gSlotAvs);
+    integer idx = 0;
+    while (idx < len)
+    {
+        key k = llList2Key(gSlotAvs, idx);
+        if (k != NULL_KEY)
+        {
+            return FALSE;
+        }
+        idx++;
+    }
+    return TRUE;
+}
+
+integer SetupListen()
+{
+    if (gListen != -1)
+    {
+        llListenRemove(gListen);
+        gListen = -1;
+    }
+
+    if (gCommChan != 0)
+    {
+        // No ID filter; we will check owner in listen()
+        gListen = llListen(gCommChan, "", "", "");
+        Debug("Listening on channel " + (string)gCommChan);
+    }
+    return 0;
+}
+
+integer SetupBall()
+{
+    // Click-to-dance, not sit
+    llSetClickAction(CLICK_ACTION_TOUCH);
+    // Clear any baked sit target
+    llSitTarget(ZERO_VECTOR, ZERO_ROTATION);
+
+    llSetText(
+        "Click to join the dance!\n(Type /24 stop to stop dancing.)",
+        <1.0, 1.0, 1.0>,
+        1.0
+    );
+    return 0;
+}
+
+integer InitBall()
+{
+    gHost         = llGetOwner();
+    gFollowMode   = FALSE;
+    gCurrentAnim  = "";
+    gShuttingDown = FALSE;
+
+    SetupBall();
+    InitSlots();
+    SetupListen();
+
+    llSetTimerEvent(gCheckInterval);
+
+    Debug("Dance ball master initialized.");
+    return 0;
+}
+
+integer BeginShutdown(string reason)
+{
+    if (gShuttingDown)
+    {
+        return 0;
+    }
+
+    gShuttingDown = TRUE;
+    Debug("Begin shutdown: " + reason);
+
+    // Tell all slots to stop their dancers; we wait to die
+    llMessageLinked(LINK_SET, LM_STOP_ALL, "", NULL_KEY);
+    return 0;
+}
+
+// ------------------------ State --------------------------
+
+default
+{
+    state_entry()
+    {
+        InitBall();
+    }
+
+    on_rez(integer start_param)
+    {
+        gCommChan = start_param;
+        Debug("Rezzed with channel " + (string)gCommChan);
+        InitBall();
+    }
+
+    changed(integer change)
+    {
+        if (change & CHANGED_OWNER)
+        {
+            gHost       = llGetOwner();
+            gShuttingDown = FALSE;
+            InitSlots();
+            Debug("Owner changed; slots cleared.");
+        }
+    }
+
+    touch_start(integer total_number)
+    {
+        // Guests can only join/leave their own slot.
+        // They cannot trigger shutdown from here.
+        if (gShuttingDown)
+        {
+            return;
+        }
+
+        integer touchIndex = 0;
+        while (touchIndex < total_number)
+        {
+            key av = llDetectedKey(touchIndex);
+
+            // Only handle agents
+            vector size = llGetAgentSize(av);
+            if (size != ZERO_VECTOR)
+            {
+                integer currentSlot = FindAvatarSlot(av);
+
+                if (currentSlot != -1)
+                {
+                    // Toggle OFF for this avatar only
+                    Debug(
+                        "Avatar " + (string)av +
+                        " is in slot " + (string)currentSlot +
+                        " -> unassigning."
+                    );
+
+                    SetSlotAvatar(currentSlot, NULL_KEY);
+
+                    string cmdUn = "UNASSIGN|" + (string)currentSlot;
+                    llMessageLinked(LINK_SET, LM_ASSIGN_SLOT, cmdUn, av);
+
+                    llRegionSayTo(
+                        av,
+                        0,
+                        "You stop dancing on this ball. You can always type /24 stop while dancing to stop yourself."
+                    );
+                }
+                else
+                {
+                    // Join: find a free slot
+                    integer freeSlot = FindFreeSlot();
+                    if (freeSlot == -1)
+                    {
+                        llRegionSayTo(
+                            av,
+                            0,
+                            "This dance ball is full. Please ask the host to rez another ball."
+                        );
+                        Debug("No free slots for avatar " + (string)av);
+                    }
+                    else
+                    {
+                        Debug(
+                            "Assigning avatar " + (string)av +
+                            " to slot " + (string)freeSlot
+                        );
+
+                        SetSlotAvatar(freeSlot, av);
+
+                        string cmdAs = "ASSIGN|" + (string)freeSlot;
+                        llMessageLinked(LINK_SET, LM_ASSIGN_SLOT, cmdAs, av);
+
+                        string msg = "You are now dancing (slot " +
+                                     (string)(freeSlot + 1) +
+                                     "). If you want to stop at any time, type /24 stop.";
+                        llRegionSayTo(av, 0, msg);
+                    }
+                }
+            }
+
+            touchIndex++;
+        }
+    }
+
+    // Update from dancer-slot scripts
+    link_message(integer sender, integer num, string str, key id)
+    {
+        if (num == LM_SLOT_FREE)
+        {
+            integer slotIndex = (integer)str;
+            if (slotIndex >= 0)
+            {
+                if (slotIndex < MAX_SLOTS)
+                {
+                    Debug(
+                        "Slot " + (string)slotIndex +
+                        " freed by avatar " + (string)id
+                    );
+                    SetSlotAvatar(slotIndex, NULL_KEY);
+                }
+            }
+        }
+    }
+
+    run_time_permissions(integer perm)
+    {
+        // Master never requests permissions; slot scripts do that.
+    }
+
+    // Messages from RezEngine / HUD / dance engine
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel != gCommChan)
+        {
+            return;
+        }
+
+        // Extra safety: only accept commands from objects
+        // owned by the same owner as the ball.
+        if (llGetOwnerKey(id) != gHost)
+        {
+            return;
+        }
+
+        msg = llStringTrim(msg, STRING_TRIM);
+
+        // --- DANCE_ANIM|<animName> ---
+        string prefixAnim = "DANCE_ANIM|";
+        integer plenAnim  = llStringLength(prefixAnim);
+        if (llSubStringIndex(msg, prefixAnim) == 0)
+        {
+            string anim = llGetSubString(msg, plenAnim, -1);
+            anim = llStringTrim(anim, STRING_TRIM);
+
+            if (anim == "")
+            {
+                Debug("Received empty DANCE_ANIM; ignoring.");
+                return;
+            }
+
+            Debug("Received DANCE_ANIM: " + anim);
+            gCurrentAnim = anim;
+
+            // Tell all slot scripts about the new anim
+            llMessageLinked(LINK_SET, LM_ANIM_UPDATE, gCurrentAnim, NULL_KEY);
+            return;
+        }
+
+        // --- MODE|FOLLOW / MODE|STAY ---
+        string prefixMode = "MODE|";
+        integer plenMode  = llStringLength(prefixMode);
+        if (llSubStringIndex(msg, prefixMode) == 0)
+        {
+            string mode = llGetSubString(msg, plenMode, -1);
+            mode = llToLower(llStringTrim(mode, STRING_TRIM));
+
+            if (mode == "follow")
+            {
+                gFollowMode = TRUE;
+                Debug("Mode: follow");
+            }
+            else if (mode == "stay")
+            {
+                gFollowMode = FALSE;
+                Debug("Mode: stay");
+            }
+            else
+            {
+                Debug("Unknown mode '" + mode + "'; ignoring.");
+            }
+            return;
+        }
+
+        // --- DANCE_STOP ---
+        if (msg == "DANCE_STOP")
+        {
+            BeginShutdown("DANCE_STOP from HUD/dance engine");
+            return;
+        }
+
+        // --- CLEANUP (from RezEngine "Clean up") ---
+        if (msg == "CLEANUP")
+        {
+            BeginShutdown("CLEANUP from RezEngine");
+            return;
+        }
+    }
+
+    timer()
+    {
+        // If we are shutting down, just wait for all slots to be free
+        if (gShuttingDown)
+        {
+            if (AllSlotsFree())
+            {
+                Debug("All slots free; deleting dance ball.");
+                llDie();
+            }
+            return;
+        }
+
+        // Host distance / presence checks
+        if (gHost != NULL_KEY)
+        {
+            list det = llGetObjectDetails(gHost, [OBJECT_POS]);
+            if (llGetListLength(det) == 0)
+            {
+                BeginShutdown("host left region");
+                return;
+            }
+
+            vector hostPos = llList2Vector(det, 0);
+            vector myPos   = llGetPos();
+            float  dist    = llVecDist(myPos, hostPos);
+
+            if (dist > gMaxDistance)
+            {
+                BeginShutdown(
+                    "host moved farther than " +
+                    (string)gMaxDistance + "m"
+                );
+                return;
+            }
+
+            if (gFollowMode)
+            {
+                vector target = hostPos + <0.0, 0.0, 2.5>;
+                llSetRegionPos(target);
+            }
+        }
+    }
+}
