@@ -1,0 +1,368 @@
+// =========================================================
+// DanceBall_Slot.lsl - One dancer slot inside the dance ball
+// =========================================================
+//
+// Each copy controls a single avatar. Multiple copies live in the
+// SAME dance ball, with different SLOT_ID values (0..19).
+//
+// Master (DanceBall_Master.lsl) sends link messages to
+// assign/unassign avatars and provide animation names.
+//
+// Behaviour:
+//  - On ASSIGN: requests PERMISSION_TRIGGER_ANIMATION from that avatar.
+//  - On permission granted: starts the current dance and tells the
+//    guest they can type /24 stop at any time.
+//  - Guest can type "/24 stop" to stop their own animation and free
+//    this slot ONLY (others continue dancing).
+//  - On STOP_ALL (cleanup / host gone / HUD stop), the slot stops the
+//    animation, informs the guest, reports free to master, then clears.
+//  - If the dancer leaves the region, slot frees itself and tells master.
+// =========================================================
+
+integer SLOT_ID = 0; // CHANGE THIS PER COPY: 0..19 for 20 slots
+
+integer PERM = PERMISSION_TRIGGER_ANIMATION;
+
+integer LM_ANIM_UPDATE = 2001;
+integer LM_ASSIGN_SLOT = 2002;
+integer LM_STOP_ALL    = 2003;
+integer LM_SLOT_FREE   = 2004;
+
+integer CHAT_STOP_CHANNEL = 24;
+
+key     gDancer        = NULL_KEY;
+integer gHavePerms     = FALSE;
+
+string  gCurrentAnim   = "";
+string  gLastAnim      = "";
+
+integer gDebug         = TRUE;
+float   gCheckInterval = 2.0;
+
+integer gStopListenHandle = -1;
+
+key     gHost          = NULL_KEY;
+string  gHostName      = "";
+
+// ------------------------ Helpers ------------------------
+
+integer Debug(string msg)
+{
+    if (gDebug)
+    {
+        key owner = llGetOwner();
+        if (owner != NULL_KEY)
+        {
+            llRegionSayTo(
+                owner,
+                0,
+                "[DANCE SLOT " + (string)SLOT_ID + "] " + msg
+            );
+        }
+    }
+    return 0;
+}
+
+// Full name: "Display (legacy)" when they differ
+string FormatName(key av)
+{
+    string legacy = llKey2Name(av);
+    string disp   = llGetDisplayName(av);
+
+    if (legacy == "")
+    {
+        return disp;
+    }
+
+    if (disp == "" || disp == legacy)
+    {
+        return legacy;
+    }
+
+    return disp + " (" + legacy + ")";
+}
+
+integer RemoveStopListen()
+{
+    if (gStopListenHandle != -1)
+    {
+        llListenRemove(gStopListenHandle);
+        gStopListenHandle = -1;
+    }
+    return 0;
+}
+
+integer SetupStopListen()
+{
+    RemoveStopListen();
+    if (gDancer != NULL_KEY)
+    {
+        gStopListenHandle = llListen(
+            CHAT_STOP_CHANNEL,
+            "",
+            gDancer,
+            ""
+        );
+    }
+    return 0;
+}
+
+integer StopDancerAnim()
+{
+    if (gDancer != NULL_KEY)
+    {
+        if (gLastAnim != "")
+        {
+            llStopAnimation(gLastAnim);
+            Debug("Stopped animation: " + gLastAnim);
+            gLastAnim = "";
+        }
+    }
+    return 0;
+}
+
+integer PlayDancerAnim()
+{
+    if (gDancer == NULL_KEY)
+    {
+        Debug("PlayDancerAnim called but no dancer.");
+        return 0;
+    }
+    if (!gHavePerms)
+    {
+        Debug("No permissions yet; cannot start animation.");
+        return 0;
+    }
+    if (gCurrentAnim == "")
+    {
+        Debug("No current animation set; nothing to play.");
+        return 0;
+    }
+
+    StopDancerAnim();
+    llStartAnimation(gCurrentAnim);
+    gLastAnim = gCurrentAnim;
+
+    Debug("Now animating dancer with: " + gCurrentAnim);
+
+    if (gHostName == "")
+    {
+        gHostName = FormatName(gHost);
+    }
+
+    llRegionSayTo(
+        gDancer,
+        0,
+        "You are now dancing with " + gHostName +
+        ". If you want to stop at any time, type /24 stop."
+    );
+
+    return 0;
+}
+
+integer ClearSlot()
+{
+    RemoveStopListen();
+    StopDancerAnim();
+    gDancer    = NULL_KEY;
+    gHavePerms = FALSE;
+    return 0;
+}
+
+// ------------------------ State --------------------------
+
+default
+{
+    state_entry()
+    {
+        gDancer      = NULL_KEY;
+        gHavePerms   = FALSE;
+        gCurrentAnim = "";
+        gLastAnim    = "";
+        gHost        = llGetOwner();
+        gHostName    = FormatName(gHost);
+
+        llSetTimerEvent(gCheckInterval);
+        Debug("Slot script started.");
+    }
+
+    on_rez(integer start_param)
+    {
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        if (change & CHANGED_OWNER)
+        {
+            gHost     = llGetOwner();
+            gHostName = FormatName(gHost);
+        }
+    }
+
+    run_time_permissions(integer perm)
+    {
+        if ((perm & PERM) != 0)
+        {
+            gHavePerms = TRUE;
+            Debug("Permissions granted by dancer " + (string)gDancer);
+            PlayDancerAnim();
+        }
+        else
+        {
+            Debug("Permissions denied by avatar " + (string)gDancer);
+            llMessageLinked(
+                LINK_SET,
+                LM_SLOT_FREE,
+                (string)SLOT_ID,
+                gDancer
+            );
+            ClearSlot();
+        }
+    }
+
+    // Messages from the master and other scripts in the ball
+    link_message(integer sender, integer num, string str, key id)
+    {
+        // Master says: new animation name
+        if (num == LM_ANIM_UPDATE)
+        {
+            string anim = llStringTrim(str, STRING_TRIM);
+            gCurrentAnim = anim;
+
+            if (gDancer != NULL_KEY)
+            {
+                if (gHavePerms)
+                {
+                    PlayDancerAnim();
+                }
+            }
+            return;
+        }
+
+        // Master assigns or unassigns this slot
+        if (num == LM_ASSIGN_SLOT)
+        {
+            list parts = llParseString2List(str, ["|"], []);
+            if (llGetListLength(parts) < 2)
+            {
+                return;
+            }
+
+            string cmd      = llList2String(parts, 0);
+            integer slotIdx = (integer)llList2String(parts, 1);
+
+            if (slotIdx != SLOT_ID)
+            {
+                return;
+            }
+
+            cmd = llToLower(llStringTrim(cmd, STRING_TRIM));
+
+            if (cmd == "assign")
+            {
+                gDancer    = id;
+                gHavePerms = FALSE;
+
+                Debug(
+                    "Assigned to avatar " + (string)gDancer +
+                    "; requesting permissions."
+                );
+                SetupStopListen();
+                llRequestPermissions(gDancer, PERM);
+            }
+            else if (cmd == "unassign")
+            {
+                Debug("Unassigned; stopping animation.");
+                ClearSlot();
+            }
+            return;
+        }
+
+        // Master tells everyone to stop and clear (shutdown path)
+        if (num == LM_STOP_ALL)
+        {
+            if (gDancer != NULL_KEY)
+            {
+                if (gHostName == "")
+                {
+                    gHostName = FormatName(gHost);
+                }
+
+                llRegionSayTo(
+                    gDancer,
+                    0,
+                    "The dance ball controlled by " + gHostName +
+                    " is ending. Your dance has been stopped. You can always type /24 stop while dancing to stop yourself."
+                );
+
+                llMessageLinked(
+                    LINK_SET,
+                    LM_SLOT_FREE,
+                    (string)SLOT_ID,
+                    gDancer
+                );
+            }
+
+            ClearSlot();
+            return;
+        }
+    }
+
+    // Guest's chat command "/24 stop" – affects ONLY this dancer
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel == CHAT_STOP_CHANNEL)
+        {
+            if (id == gDancer)
+            {
+                string cmd = llToLower(
+                    llStringTrim(msg, STRING_TRIM)
+                );
+
+                if (cmd == "stop")
+                {
+                    if (gHostName == "")
+                    {
+                        gHostName = FormatName(gHost);
+                    }
+
+                    llRegionSayTo(
+                        gDancer,
+                        0,
+                        "You stop dancing with " + gHostName +
+                        ". You can type /24 stop any time you are dancing to stop yourself."
+                    );
+
+                    llMessageLinked(
+                        LINK_SET,
+                        LM_SLOT_FREE,
+                        (string)SLOT_ID,
+                        gDancer
+                    );
+                    ClearSlot();
+                }
+            }
+        }
+    }
+
+    timer()
+    {
+        // If the dancer leaves the region, free this slot
+        if (gDancer != NULL_KEY)
+        {
+            vector size = llGetAgentSize(gDancer);
+            if (size == ZERO_VECTOR)
+            {
+                Debug("Dancer left region; freeing slot.");
+                llMessageLinked(
+                    LINK_SET,
+                    LM_SLOT_FREE,
+                    (string)SLOT_ID,
+                    gDancer
+                );
+                ClearSlot();
+            }
+        }
+    }
+}
