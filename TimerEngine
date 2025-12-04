@@ -1,0 +1,298 @@
+integer LM_TIMER_ENGINE = 1007;
+integer LM_CONFIG_PASS  = 1008;
+integer LM_DUMP_BRIDGE = 1013;
+
+string CFG_TIMER_MINS = "timer_mins";
+string CFG_SETLENGTH  = "setlength";
+
+key gOwner;
+integer gTimerActive = FALSE;
+float gTimerIntervalSec = 0.0;
+float gEventLengthHours = 0.0;
+
+float gEventStartTime = 0.0;
+float gNextInfoTime = 0.0;
+float gHalfWarnTime = 0.0;
+integer gHalfWarnSent = FALSE;
+
+integer gTextPrimLink = 0;
+
+// Find the link number of the "Text prim"
+integer FindTextPrim()
+{
+    integer count = llGetNumberOfPrims();
+    integer i = 1;
+    while (i <= count)
+    {
+        if (llGetLinkName(i) == "Text prim")
+        {
+            return i;
+        }
+        i++;
+    }
+    return 0;
+}
+
+// Update the HUD text, preserving the venue/DJ line and
+// only changing/adding the "Next Reminder:" line.
+integer UpdateCountdownText()
+{
+    if (gTextPrimLink == 0)
+    {
+        gTextPrimLink = FindTextPrim();
+    }
+    if (gTextPrimLink == 0) return 0;
+
+    // Get current text/color/alpha so we don't stomp everything
+    list data = llGetLinkPrimitiveParams(gTextPrimLink, [PRIM_TEXT]);
+    string existing = "";
+    vector color    = <1.0, 1.0, 1.0>;
+    float  alpha    = 1.0;
+
+    integer len = llGetListLength(data);
+    if (len >= 1) existing = llList2String(data, 0);
+    if (len >= 2) color    = (vector)llList2String(data, 1);
+    if (len >= 3) alpha    = llList2Float(data, 2);
+
+    // Strip any existing "Next Reminder:" line from the bottom
+    integer idx = llSubStringIndex(existing, "\nNext Reminder:");
+    string head;
+    if (idx != -1)
+    {
+        head = llGetSubString(existing, 0, idx - 1);
+    }
+    else
+    {
+        // If the whole text starts with "Next Reminder:", treat as no header
+        if (llSubStringIndex(existing, "Next Reminder:") == 0)
+        {
+            head = "";
+        }
+        else
+        {
+            head = existing;
+        }
+    }
+
+    // Build the new "Next Reminder:" line
+    string line;
+    if (!gTimerActive || gTimerIntervalSec <= 0.0 || gNextInfoTime <= 0.0)
+    {
+        line = "Next Reminder: off";
+    }
+    else
+    {
+        float remain = gNextInfoTime - llGetTime();
+        if (remain < 0.0) remain = 0.0;
+        integer total = (integer)remain;
+        integer mins = total / 60;
+        integer secs = total % 60;
+        if (mins > 0)
+        {
+            line = "Next Reminder: " + (string)mins + "m " + (string)secs + "s";
+        }
+        else
+        {
+            line = "Next Reminder: " + (string)secs + "s";
+        }
+    }
+
+    // Combine header + new line
+    string finalText = head;
+    if (finalText != "" && line != "")
+    {
+        finalText += "\n";
+    }
+    if (line != "")
+    {
+        finalText += line;
+    }
+
+    llSetLinkPrimitiveParamsFast(
+        gTextPrimLink,
+        [PRIM_TEXT, finalText, color, alpha]
+    );
+    return 0;
+}
+
+// Compute half-time minus 10 minutes from event start
+integer RecomputeHalfWarning()
+{
+    gHalfWarnTime = 0.0;
+    if (gEventLengthHours > 0.0)
+    {
+        float halfDurationSec = (gEventLengthHours * 3600.0) / 2.0;
+        float warnOffset = halfDurationSec - 600.0;
+        if (warnOffset > 0.0)
+        {
+            gHalfWarnTime = gEventStartTime + warnOffset;
+        }
+    }
+    return 0;
+}
+
+// Compute next info reminder from "now"
+integer RecomputeNextInfo()
+{
+    if (gTimerIntervalSec > 0.0)
+    {
+        gNextInfoTime = llGetTime() + gTimerIntervalSec;
+    }
+    else
+    {
+        gNextInfoTime = 0.0;
+    }
+    return 0;
+}
+
+default
+{
+    state_entry()
+    {
+        gOwner = llGetOwner();
+        gTimerActive = FALSE;
+        gTimerIntervalSec = 0.0;
+        gEventLengthHours = 0.0;
+        gEventStartTime = 0.0;
+        gNextInfoTime = 0.0;
+        gHalfWarnTime = 0.0;
+        gHalfWarnSent = FALSE;
+        gTextPrimLink = FindTextPrim();
+        llSetTimerEvent(0.0);
+        // Do NOT call UpdateCountdownText here so we don't wipe Core's text
+    }
+
+    on_rez(integer param)
+    {
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        if (change & CHANGED_OWNER)
+        {
+            gOwner = llGetOwner();
+        }
+        if (change & CHANGED_LINK)
+        {
+            gTextPrimLink = FindTextPrim();
+        }
+    }
+
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        // Config from CORE
+        if (num == LM_CONFIG_PASS)
+        {
+            list parts = llParseString2List(str, ["|"], []);
+            if (llGetListLength(parts) >= 2)
+            {
+                string keyName = llList2String(parts, 0);
+                string value = llDumpList2String(llList2List(parts, 1, -1), "|");
+
+                if (keyName == CFG_TIMER_MINS)
+                {
+                    float mins = (float)value;
+                    if (mins <= 0.0)
+                    {
+                        gTimerIntervalSec = 0.0;
+                    }
+                    else
+                    {
+                        gTimerIntervalSec = mins * 60.0;
+                    }
+                    if (gTimerActive)
+                    {
+                        RecomputeNextInfo();
+                    }
+                    UpdateCountdownText();
+                }
+                else if (keyName == CFG_SETLENGTH)
+                {
+                    float hrs = (float)value;
+                    if (hrs < 0.0) hrs = 0.0;
+                    gEventLengthHours = hrs;
+                    if (gTimerActive)
+                    {
+                        RecomputeHalfWarning();
+                    }
+                }
+            }
+        }
+        // Toggle from Timer button in CORE
+        else if (num == LM_TIMER_ENGINE)
+        {
+            if (str == "TOGGLE")
+            {
+                gTimerActive = !gTimerActive;
+                if (gTimerActive)
+                {
+                    gEventStartTime = llGetTime();
+                    gHalfWarnSent = FALSE;
+
+                    if (gTimerIntervalSec > 0.0)
+                    {
+                        gNextInfoTime = gEventStartTime + gTimerIntervalSec;
+                    }
+                    else
+                    {
+                        gNextInfoTime = 0.0;
+                    }
+                    RecomputeHalfWarning();
+                    llSetTimerEvent(5.0);
+
+                    llRegionSayTo(
+                        gOwner,
+                        0,
+                        "Timer: ON. Reminders every " +
+                        (string)(gTimerIntervalSec / 60.0) +
+                        " minutes (if > 0) and half-time warning from setlength."
+                    );
+                }
+                else
+                {
+                    llSetTimerEvent(0.0);
+                    llRegionSayTo(gOwner, 0, "Timer: OFF.");
+                }
+                UpdateCountdownText();
+            }
+        }
+    }
+
+    timer()
+    {
+        if (!gTimerActive) return;
+
+        float now = llGetTime();
+        string ownerName = llKey2Name(gOwner);
+        if (ownerName == "") ownerName = "Host";
+
+        // Periodic info reminder
+        if (gTimerIntervalSec > 0.0 && gNextInfoTime > 0.0 && now >= gNextInfoTime)
+        {
+            llRegionSayTo(
+                gOwner,
+                0,
+                ownerName + ", your timer has counted down. Have you sent an informational post recently?"
+            );
+            while (gNextInfoTime <= now && gTimerIntervalSec > 0.0)
+            {
+                gNextInfoTime += gTimerIntervalSec;
+            }
+        }
+
+        // Half-time warning
+        if (!gHalfWarnSent && gHalfWarnTime > 0.0 && now >= gHalfWarnTime)
+        {
+            llRegionSayTo(
+                gOwner,
+                0,
+                ownerName + ", it is almost half time! Are your notices out?"
+            );
+            gHalfWarnSent = TRUE;
+        }
+
+        // Update countdown under the existing venue/DJ text
+        UpdateCountdownText();
+    }
+}
