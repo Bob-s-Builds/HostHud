@@ -1,0 +1,245 @@
+// =========================================================
+// TipJarFollowerPlus.lsl (with CLEANUP + SET_TEXTURE support)
+// =========================================================
+
+integer gChan       = 0;        // private channel from RezEngine (start_param)
+key     gOwner      = NULL_KEY; // owner of the jar (HUD owner)
+string  gOwnerName  = "";
+integer gFollow     = FALSE;
+float   gMaxDist    = 100.0;
+float   gTick       = 0.3;
+
+// Offset relative to avatar when following
+vector  gFollowOffset = <1.5, 0.0, -0.5>;
+
+// Tip tracking
+integer gTotalTips      = 0;
+integer gSessionMax     = 0;
+string  gSessionMaxName = "";
+integer gLastTipAmount  = 0;
+string  gLastTipperName = "";
+
+// Face for owner image texture
+integer FACE_OWNER_IMAGE = 1;
+
+// Texture set via RezEngine "SET_TEXTURE|..." (usually a UUID)
+string gOwnerImageTex = "";
+
+// ---------- Helpers ----------
+
+updateOwner()
+{
+    if (gOwner == NULL_KEY)
+    {
+        gOwner = llGetOwner();
+    }
+    if (gOwnerName == "" && gOwner != NULL_KEY)
+    {
+        gOwnerName = llKey2Name(gOwner);
+    }
+}
+
+// If RezEngine has sent us a specific texture (gOwnerImageTex),
+// use that; otherwise fall back to "first texture in contents".
+ChooseOwnerImage()
+{
+    // Preferred: explicit texture from RezEngine
+    if (gOwnerImageTex != "")
+    {
+        llSetTexture(gOwnerImageTex, FACE_OWNER_IMAGE);
+        return;
+    }
+
+    // Fallback: use first texture in the jar's own inventory
+    integer count = llGetInventoryNumber(INVENTORY_TEXTURE);
+    if (count <= 0) return;
+
+    string texName = llGetInventoryName(INVENTORY_TEXTURE, 0);
+    if (texName != "")
+    {
+        llSetTexture(texName, FACE_OWNER_IMAGE);
+    }
+}
+
+UpdateHoverText()
+{
+    updateOwner();
+
+    string line1;
+    if (gLastTipAmount > 0 && gLastTipperName != "")
+    {
+        line1 = "Last tip: " + gLastTipperName + " (L$" + (string)gLastTipAmount + ")";
+    }
+    else
+    {
+        line1 = "Last tip: none yet.";
+    }
+
+    string line2;
+    if (gSessionMax > 0 && gSessionMaxName != "")
+    {
+        line2 = "Biggest tip: " + gSessionMaxName + " (L$" + (string)gSessionMax + ")";
+    }
+    else
+    {
+        line2 = "Biggest tip: none yet.";
+    }
+
+    string line3 = "Total tipped this session: L$" + (string)gTotalTips;
+
+    string who = gOwnerName;
+    if (who == "") who = "the performer";
+
+    string line4 = "Pay this jar to tip " + who + "!";
+
+    string full = line1 + "\n" + line2 + "\n" + line3 + "\n" + line4;
+
+    llSetText(full, <1.0, 0.85, 0.3>, 1.0);
+}
+
+followStep()
+{
+    updateOwner();
+    if (gOwner == NULL_KEY) return;
+
+    list det = llGetObjectDetails(gOwner, [OBJECT_POS, OBJECT_ROT]);
+    if (llGetListLength(det) < 2)
+    {
+        llDie();
+        return;
+    }
+
+    vector   ownerPos = llList2Vector(det, 0);
+    rotation ownerRot = llList2Rot(det, 1);
+    vector   myPos    = llGetPos();
+
+    if (llVecDist(ownerPos, myPos) > gMaxDist)
+    {
+        llDie();
+        return;
+    }
+
+    if (!gFollow) return;
+
+    vector targetPos = ownerPos + (gFollowOffset * ownerRot);
+    llSetRegionPos(targetPos);
+}
+
+// ---------- State ----------
+
+default
+{
+    state_entry()
+    {
+        gOwner      = llGetOwner();
+        gOwnerName  = llKey2Name(gOwner);
+        gFollow     = FALSE;
+
+        gTotalTips      = 0;
+        gSessionMax     = 0;
+        gSessionMaxName = "";
+        gLastTipAmount  = 0;
+        gLastTipperName = "";
+        gOwnerImageTex  = "";
+
+        if (gChan != 0)
+        {
+            llListen(gChan, "", "", "");
+        }
+
+        ChooseOwnerImage();
+        UpdateHoverText();
+        llSetTimerEvent(gTick);
+    }
+
+    on_rez(integer start_param)
+    {
+        gChan      = start_param;
+        gOwner     = llGetOwner();
+        gOwnerName = llKey2Name(gOwner);
+        gFollow    = FALSE;
+
+        if (gChan != 0)
+        {
+            llListen(gChan, "", "", "");
+        }
+
+        gTotalTips      = 0;
+        gSessionMax     = 0;
+        gSessionMaxName = "";
+        gLastTipAmount  = 0;
+        gLastTipperName = "";
+        gOwnerImageTex  = "";
+
+        ChooseOwnerImage();
+        UpdateHoverText();
+        llSetTimerEvent(gTick);
+    }
+
+    money(key id, integer amount)
+    {
+        string name = llKey2Name(id);
+
+        gTotalTips      += amount;
+        gLastTipAmount   = amount;
+        gLastTipperName  = name;
+
+        if (amount > gSessionMax)
+        {
+            gSessionMax     = amount;
+            gSessionMaxName = name;
+        }
+
+        UpdateHoverText();
+        llRegionSayTo(id, 0, "Thank you for your tip of L$" + (string)amount + "!");
+    }
+
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel != gChan) return;
+
+        msg = llStringTrim(msg, STRING_TRIM);
+
+        // Texture message from RezEngine:
+        // "SET_TEXTURE|<uuidOrName>"
+        string prefixTex = "SET_TEXTURE|";
+        integer plenTex  = llStringLength(prefixTex);
+        if (llSubStringIndex(msg, prefixTex) == 0)
+        {
+            string tex = llGetSubString(msg, plenTex, -1);
+            tex = llStringTrim(tex, STRING_TRIM);
+
+            if (tex != "")
+            {
+                gOwnerImageTex = tex;
+                // Apply immediately to the designated face
+                llSetTexture(tex, FACE_OWNER_IMAGE);
+            }
+            return;
+        }
+
+        if (msg == "MODE|FOLLOW")
+        {
+            gFollow = TRUE;
+        }
+        else if (msg == "MODE|STAY")
+        {
+            gFollow = FALSE;
+        }
+        else if (msg == "DANCE_STOP")
+        {
+            // Tip jar does NOT auto-die on dance stop (by design).
+            // If you ever want it, uncomment:
+            // llDie();
+        }
+        else if (msg == "CLEANUP")
+        {
+            llDie();
+        }
+    }
+
+    timer()
+    {
+        followStep();
+    }
+}
