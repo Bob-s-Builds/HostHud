@@ -1,0 +1,317 @@
+// =========================================================
+// HUD_Display.lsl - HUD text + shrink handling (layout-safe)
+// =========================================================
+//
+// Behavior vs old version:
+//  - Uses the *current built sizes* as canonical, not hard-coded
+//    constants. This means your button layout stays exactly as
+//    you built it, for all users.
+//  - Minimize:
+//       * Each non-shrink prim size = original_size * SHRINK_FACTOR
+//       * All non-shrink prims alpha = 0.0
+//       * Shrink button stays visible, original size, alpha = 1.0
+//  - Restore:
+//       * Every prim size snapped back to original built size
+//       * All alphas = 1.0
+//  - Text:
+//       * Controlled via LM_HUD_DISPLAY and gHUDMinimized
+//       * Hidden when minimized, visible when expanded
+//
+// No positions are ever changed, only size/alpha.
+// =========================================================
+
+integer LM_HUD_DISPLAY = 1015;      // shared with CORE
+string  HUD_SHRINK_NAME = "shrink"; // name of the shrink button prim
+string  TEXT_PRIM_NAME  = "Text prim";
+
+// Shrink handling (percent-based from *original* sizes)
+float   SHRINK_FACTOR    = 0.1;     // scale multiplier when minimizing (10%)
+float   MIN_SIZE_CLAMP   = 0.01;    // don't let prims go smaller than this
+
+integer gTextPrimLink   = 0;        // link number of "Text prim"
+integer gShrinkLink     = 0;        // link number of "shrink" button
+integer gHUDMinimized   = FALSE;    // TRUE when HUD is minimized
+string  gHUDText        = "";       // full HUD text from CORE
+
+// Stored base sizes (canonical = as-built)
+// index 0 -> link 1, index 1 -> link 2, etc.
+list gBaseSizes;
+
+// ----------------- HELPERS -----------------
+
+string Trim(string s)
+{
+    return llStringTrim(s, STRING_TRIM);
+}
+
+// Find and cache the link numbers for Text prim and shrink button
+integer RefreshSpecialLinks()
+{
+    gTextPrimLink = 0;
+    gShrinkLink   = 0;
+
+    integer count = llGetNumberOfPrims();
+    integer i = 1;
+    while (i <= count)
+    {
+        string nm = llGetLinkName(i);
+        if (nm == TEXT_PRIM_NAME)
+        {
+            gTextPrimLink = i;
+        }
+        if (nm == HUD_SHRINK_NAME)
+        {
+            gShrinkLink = i;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Capture the current sizes of all links as "canonical"
+// (the built layout sizes)
+integer CacheBaseSizes()
+{
+    gBaseSizes = [];
+    integer count = llGetNumberOfPrims();
+    integer i = 1;
+
+    while (i <= count)
+    {
+        list params = llGetLinkPrimitiveParams(i, [PRIM_SIZE]);
+        vector sz   = llList2Vector(params, 0);
+        gBaseSizes += [sz];
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Get the cached base size for a given link
+vector GetBaseSize(integer link)
+{
+    // link is 1-based; list index is 0-based
+    integer idx = link - 1;
+    if (idx < 0)
+    {
+        return <0.1, 0.1, 0.1>;
+    }
+
+    if (idx >= llGetListLength(gBaseSizes))
+    {
+        return <0.1, 0.1, 0.1>;
+    }
+
+    return llList2Vector(gBaseSizes, idx);
+}
+
+// Restore all link sizes to their cached base sizes (expanded state)
+integer RestoreSizes()
+{
+    integer count = llGetNumberOfPrims();
+    integer i = 1;
+
+    while (i <= count)
+    {
+        vector base = GetBaseSize(i);
+        llSetLinkPrimitiveParamsFast(i, [PRIM_SIZE, base]);
+        i = i + 1;
+    }
+
+    // Ensure all are visible (expanded state)
+    i = 1;
+    while (i <= count)
+    {
+        llSetLinkAlpha(i, 1.0, -1); // -1 == ALL_SIDES
+        i = i + 1;
+    }
+
+    return 0;
+}
+
+// Apply gHUDText to the text prim (or root) with alpha depending on minimized state
+integer UpdateDisplayText()
+{
+    float alpha;
+    if (gHUDMinimized)
+    {
+        alpha = 0.0;
+    }
+    else
+    {
+        alpha = 1.0;
+    }
+
+    if (gTextPrimLink != 0)
+    {
+        llSetLinkPrimitiveParamsFast(
+            gTextPrimLink,
+            [PRIM_TEXT, gHUDText, <1.0, 1.0, 1.0>, alpha]
+        );
+    }
+    else
+    {
+        // Fallback: put text on the root prim if "Text prim" not found
+        llSetText(gHUDText, <1.0, 1.0, 1.0>, alpha);
+    }
+    return 0;
+}
+
+// Minimize: set sizes = base_size * SHRINK_FACTOR and hide all but shrink button
+integer MinimizeHUD()
+{
+    integer count = llGetNumberOfPrims();
+    integer i = 1;
+
+    while (i <= count)
+    {
+        if (i == gShrinkLink)
+        {
+            // Shrink button: stay at its base size and visible
+            vector base = GetBaseSize(i);
+            llSetLinkPrimitiveParamsFast(i, [PRIM_SIZE, base]);
+            llSetLinkAlpha(i, 1.0, -1);
+        }
+        else
+        {
+            vector base = GetBaseSize(i);
+            vector newSz = base * SHRINK_FACTOR;
+
+            // Clamp to a small but non-zero size
+            if (newSz.x < MIN_SIZE_CLAMP)
+            {
+                newSz.x = MIN_SIZE_CLAMP;
+            }
+            if (newSz.y < MIN_SIZE_CLAMP)
+            {
+                newSz.y = MIN_SIZE_CLAMP;
+            }
+            if (newSz.z < MIN_SIZE_CLAMP)
+            {
+                newSz.z = MIN_SIZE_CLAMP;
+            }
+
+            llSetLinkPrimitiveParamsFast(i, [PRIM_SIZE, newSz]);
+            llSetLinkAlpha(i, 0.0, -1); // hide non-shrink prims
+        }
+        i = i + 1;
+    }
+
+    gHUDMinimized = TRUE;
+    UpdateDisplayText();
+    return 0;
+}
+
+// Restore: snap sizes / alphas back to cached base sizes
+integer RestoreHUD()
+{
+    RestoreSizes();
+    gHUDMinimized = FALSE;
+    UpdateDisplayText();
+    return 0;
+}
+
+// Toggle HUD minimized / expanded using gHUDMinimized flag
+integer ToggleHUDMinimize()
+{
+    // If there is no shrink button, do nothing
+    if (gShrinkLink == 0)
+    {
+        return 0;
+    }
+
+    if (gHUDMinimized)
+    {
+        // --------- EXPAND HUD ---------
+        RestoreHUD();
+    }
+    else
+    {
+        // --------- MINIMIZE HUD ---------
+        MinimizeHUD();
+    }
+
+    return 0;
+}
+
+// ----------------- STATE -----------------
+
+default
+{
+    state_entry()
+    {
+        RefreshSpecialLinks();
+        CacheBaseSizes();
+
+        if (gShrinkLink == 0)
+        {
+            key owner = llGetOwner();
+            if (owner != NULL_KEY)
+            {
+                // Use IM instead of owner-say so it never hits local chat
+                llInstantMessage(
+                    owner,
+                    "[HUD_DISPLAY] WARNING: No prim named 'shrink' found; minimize won't work."
+                );
+            }
+        }
+
+        // Start expanded, using the as-built layout
+        gHUDMinimized = FALSE;
+        gHUDText      = "Host HUD: waiting for configuration...";
+
+        RestoreSizes();     // Apply base sizes (as built)
+        UpdateDisplayText();  // Apply text with proper alpha
+    }
+
+    on_rez(integer sp)
+    {
+        // Rebuild caches on rez, but do not change layout beyond base sizes
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        // If owner changes, or linkset/inventory changes,
+        // just refresh our cached info but DO NOT reset script
+        // (which would force canonical sizes, which we no longer do).
+        if (change & (CHANGED_OWNER | CHANGED_LINK | CHANGED_INVENTORY))
+        {
+            RefreshSpecialLinks();
+
+            // Only recache base sizes when not minimized, so we don't
+            // accidentally treat shrunk sizes as the new "base".
+            if (!gHUDMinimized)
+            {
+                CacheBaseSizes();
+            }
+
+            // Keep whatever text we had; just make sure alpha is correct
+            UpdateDisplayText();
+        }
+    }
+
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        // CORE sends text updates on LM_HUD_DISPLAY
+        if (num == LM_HUD_DISPLAY)
+        {
+            gHUDText = str;
+            UpdateDisplayText();
+            return;
+        }
+
+        // Button router sends labels with num == 0
+        if (num == 0)
+        {
+            string prefix = Trim(str);
+            string lower  = llToLower(prefix);
+
+            // Shrink button ALWAYS works, no config needed
+            if (lower == "shrink")
+            {
+                ToggleHUDMinimize();
+                return;
+            }
+        }
+    }
+}
