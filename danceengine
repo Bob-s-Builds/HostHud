@@ -628,3 +628,4 @@ default
         gCurrentQuery = llGetNotecardLine(gCurrentCard, gCurrentLine);
     }
 }
+
