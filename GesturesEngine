@@ -1,0 +1,167 @@
+// =========================================================
+// GesturesEngine.lsl — Uses gest_* entries from venue + DJ
+// Now whispers the gesture trigger to the user instead of
+// saying it in public chat.
+// ---------------------------------------------------------
+// Payload from CORE: "GESTURES|Wave=/wave|Cheer=/cheer|..."
+//   label = "Wave", cmd = "/wave"
+// When the user picks "Wave", we whisper the trigger:
+//   "[Gestures] Wave trigger: /wave"
+// =========================================================
+
+integer LM_GESTURE_ENGINE = 1010;
+integer LM_DEBUG_MODE     = 1012;
+integer LM_DUMP_BRIDGE    = 1013;
+
+// Payload: "GESTURES|Wave=/wave|Cheer=/cheer|..."
+list   gLabels;        // ["Wave", "Cheer", ...]
+list   gCmds;          // ["/wave", "/cheer", ...]
+integer gDialogChan   = 0;
+integer gDialogHandle = -1;
+
+key     gOwner     = NULL_KEY;
+integer gDebugMode = FALSE;
+
+// Small helpers
+string Trim(string s)
+{
+    return llStringTrim(s, STRING_TRIM);
+}
+
+integer IsGesturesPayload(string s)
+{
+    if (llSubStringIndex(s, "GESTURES|") == 0)
+    {
+        return TRUE;
+    }
+    return FALSE;
+}
+
+integer OpenGestureDialog()
+{
+    integer count = llGetListLength(gLabels);
+    if (count == 0) return FALSE;
+
+    integer MAX_BUTTONS = 12;
+    list buttons = gLabels;
+    if (count > MAX_BUTTONS)
+    {
+        buttons = llList2List(buttons, 0, MAX_BUTTONS - 1);
+    }
+
+    gDialogChan   = (integer)((llFrand(1000000.0) * -1.0) - 1.0);
+    gDialogHandle = llListen(gDialogChan, "", gOwner, "");
+
+    llDialog(gOwner, "Choose a gesture:", buttons + [ "Cancel" ], gDialogChan);
+    llSetTimerEvent(30.0);
+    return TRUE;
+}
+
+integer CloseDialog()
+{
+    if (gDialogHandle != -1)
+    {
+        llListenRemove(gDialogHandle);
+        gDialogHandle = -1;
+    }
+    gDialogChan = 0;
+    llSetTimerEvent(0.0);
+    return TRUE;
+}
+
+default
+{
+    state_entry()
+    {
+        gOwner = llGetOwner();
+        llSetText("", <1.0, 1.0, 1.0>, 1.0);
+    }
+
+    changed(integer change)
+    {
+        if (change & CHANGED_OWNER)
+        {
+            gOwner = llGetOwner();
+        }
+    }
+
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        if (num == LM_DEBUG_MODE)
+        {
+            if (str == "ON")  gDebugMode = TRUE;
+            if (str == "OFF") gDebugMode = FALSE;
+            return;
+        }
+
+        if (num == LM_GESTURE_ENGINE)
+        {
+            if (!IsGesturesPayload(str)) return;
+
+            // Parse payload into labels and commands
+            list parts = llParseStringKeepNulls(str, ["|"], []);
+            integer len = llGetListLength(parts);
+            if (len < 2) return;
+
+            gLabels = [];
+            gCmds   = [];
+
+            integer i = 1;
+            while (i < len)
+            {
+                string pair = llList2String(parts, i);
+                integer eq  = llSubStringIndex(pair, "=");
+                if (eq > 0)
+                {
+                    string label = Trim(llGetSubString(pair, 0, eq - 1));
+                    string cmd   = Trim(llGetSubString(pair, eq + 1, -1));
+                    if (label != "" && cmd != "")
+                    {
+                        gLabels += [label];
+                        gCmds   += [cmd];
+                    }
+                }
+                i = i + 1;
+            }
+
+            if (llGetListLength(gLabels) == 0) return;
+
+            OpenGestureDialog();
+        }
+    }
+
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel != gDialogChan) return;
+        if (id != gOwner)          return;
+
+        CloseDialog();
+
+        string choice = Trim(msg);
+        if (choice == "Cancel") return;
+
+        integer idx = llListFindList(gLabels, [ choice ]);
+        if (idx == -1) return;
+
+        string cmd = llList2String(gCmds, idx);
+        if (cmd != "")
+        {
+            // Always whisper the trigger to the owner so they can remember it
+            llRegionSayTo(
+                gOwner,
+                0,
+                "[Gestures] " + choice + " trigger: " + cmd
+            );
+        }
+    }
+
+    timer()
+    {
+        CloseDialog();
+    }
+
+    on_rez(integer sp)
+    {
+        llResetScript();
+    }
+}
