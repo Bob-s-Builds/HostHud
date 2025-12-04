@@ -1,0 +1,799 @@
+// -----------------------------------------------------------------------------
+// SHOUTENGINE.LSL — Shout menus + debug-aware "shout as owner"
+// -----------------------------------------------------------------------------
+// Integrates with CORE and other engines (Socials, Radar, etc):
+//
+//  - CORE sends final texts on LM_SHOUT_ENGINE as plain strings (legacy behavior).
+//    * If id == NULL_KEY  -> treat as SHOUT on /0.
+//    * If id != NULL_KEY  -> treat as LOCAL SAY on /0 (e.g. socials, greets).
+//
+//  - CORE sends shout config lines while reading notecards as:
+//        "CFG_RESET"
+//        "CFG|V|shout_name|value"
+//        "CFG|D|shout_name|value"
+//
+//  - CORE sends "MENU" (id = host) when the "shout" button is clicked,
+//    and ShoutEngine handles all blue menus + paging for shout_* entries.
+//
+// In debug mode, ALL output is owner-only (no public chat).
+// -----------------------------------------------------------------------------
+
+integer LM_SHOUT_ENGINE = 1001;   // MUST match Core
+integer LM_DEBUG_MODE   = 1012;   // Global debug mode link message
+integer LM_DUMP_BRIDGE  = 1013;
+
+integer SHOUT_CHANNEL   = 0;      // public chat
+integer CHAT_CHANNEL    = 0;      // public chat
+
+integer CHANNEL_MENU    = -99000; // shared dialog channel
+
+// Dialog phases
+integer PHASE_NONE       = 0;
+integer PHASE_MAIN       = 1;
+integer PHASE_VENUE      = 2;
+integer PHASE_DJ         = 3;
+integer PHASE_ALL        = 4;
+
+integer gDebugMode   = FALSE;
+string  gOriginalName = "";
+key     gOwner        = NULL_KEY;
+
+// Shout config
+list    gVenueShouts = []; // [label, text, label, text, ...]
+list    gDjShouts    = [];
+
+// Menu state
+integer gDialogPhase  = PHASE_NONE;
+integer gListenHandle = -1;
+integer gVenuePage    = 0;
+integer gDjPage       = 0;
+integer gAllPage      = 0;
+key     gHost         = NULL_KEY;
+
+// ------------------ HELPERS ------------------
+
+// Debug helper: only speaks in debug mode, owner-only
+integer Debug(string msg)
+{
+    if (gDebugMode && gOwner != NULL_KEY)
+    {
+        llRegionSayTo(gOwner, 0, "[SHOUT DEBUG] " + msg);
+    }
+    return 0;
+}
+
+// Helper: speak "as" the owner. In debug mode, this is owner-only;
+// in normal mode, this is public chat (say or shout).
+integer ShoutAsOwner(string text, integer isShout)
+{
+    if (text == "") return 0;
+
+    string ownerName = llKey2Name(gOwner);
+    if (ownerName == "")
+    {
+        ownerName = gOriginalName;
+    }
+
+    llSetObjectName(ownerName);
+
+    if (gDebugMode)
+    {
+        if (gOwner != NULL_KEY)
+        {
+            llRegionSayTo(gOwner, 0, text);
+        }
+    }
+    else
+    {
+        if (isShout)
+        {
+            llShout(SHOUT_CHANNEL, text);
+        }
+        else
+        {
+            llSay(CHAT_CHANNEL, text);
+        }
+    }
+
+    llSetObjectName(gOriginalName);
+
+    return 0;
+}
+
+// Random variant selection (split on "||")
+string PickRandomVariant(string raw)
+{
+    list parts = llParseString2List(raw, ["||"], []);
+
+    list clean = [];
+    integer i = 0;
+    integer len = llGetListLength(parts);
+    while (i < len)
+    {
+        string s = llStringTrim(llList2String(parts, i), STRING_TRIM);
+        if (s != "")
+        {
+            clean += [s];
+        }
+        i = i + 1;
+    }
+
+    len = llGetListLength(clean);
+    if (len == 0) return "";
+    if (len == 1) return llList2String(clean, 0);
+
+    integer idx = (integer)llFrand((float)len);
+    return llList2String(clean, idx);
+}
+
+// Make display label from "shout_name" -> "Name"
+string ShoutLabelFromKey(string keyName)
+{
+    string lowerKey = llToLower(keyName);
+    if (llSubStringIndex(lowerKey, "shout_") != 0)
+    {
+        return "";
+    }
+
+    string raw = llGetSubString(keyName, 6, -1);
+    raw = llStringTrim(raw, STRING_TRIM);
+    if (raw == "")
+    {
+        return "Shout";
+    }
+
+    string first = llToUpper(llGetSubString(raw, 0, 0));
+    string rest  = "";
+    if (llStringLength(raw) > 1)
+    {
+        rest = llToLower(llGetSubString(raw, 1, -1));
+    }
+    return first + rest;
+}
+
+// Add a shout to venue or DJ list
+list AddShout(list store, string keyName, string value)
+{
+    string label = ShoutLabelFromKey(keyName);
+    if (label == "")
+    {
+        return store;
+    }
+
+    // Just append; CORE sends CFG_RESET before new config load.
+    store += [label, value];
+    return store;
+}
+
+// Build label lists from stored [label, text, ...]
+list GetVenueLabels()
+{
+    list out = [];
+    integer len = llGetListLength(gVenueShouts);
+    integer i = 0;
+    while (i < len)
+    {
+        out += [llList2String(gVenueShouts, i)];
+        i = i + 2;
+    }
+    return out;
+}
+
+list GetDjLabels()
+{
+    list out = [];
+    integer len = llGetListLength(gDjShouts);
+    integer i = 0;
+    while (i < len)
+    {
+        out += [llList2String(gDjShouts, i)];
+        i = i + 2;
+    }
+    return out;
+}
+
+// Lookup text by label
+string GetVenueText(string label)
+{
+    label = llStringTrim(label, STRING_TRIM);
+    integer len = llGetListLength(gVenueShouts);
+    integer i = 0;
+    while (i < len)
+    {
+        string lbl = llList2String(gVenueShouts, i);
+        if (lbl == label)
+        {
+            return llList2String(gVenueShouts, i + 1);
+        }
+        i = i + 2;
+    }
+    return "";
+}
+
+string GetDjText(string label)
+{
+    label = llStringTrim(label, STRING_TRIM);
+    integer len = llGetListLength(gDjShouts);
+    integer i = 0;
+    while (i < len)
+    {
+        string lbl = llList2String(gDjShouts, i);
+        if (lbl == label)
+        {
+            return llList2String(gDjShouts, i + 1);
+        }
+        i = i + 2;
+    }
+    return "";
+}
+
+// Combined labels V:Label / D:Label
+list GetAllLabels()
+{
+    list out = [];
+    list v = GetVenueLabels();
+    list d = GetDjLabels();
+
+    integer lenV = llGetListLength(v);
+    integer lenD = llGetListLength(d);
+    integer i = 0;
+
+    while (i < lenV)
+    {
+        out += ["V:" + llList2String(v, i)];
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < lenD)
+    {
+        out += ["D:" + llList2String(d, i)];
+        i = i + 1;
+    }
+
+    return out;
+}
+
+// Listen management
+integer EnsureListen()
+{
+    if (gListenHandle != -1)
+    {
+        llListenRemove(gListenHandle);
+        gListenHandle = -1;
+    }
+    gListenHandle = llListen(CHANNEL_MENU, "", gHost, "");
+    return 0;
+}
+
+integer CloseListen()
+{
+    if (gListenHandle != -1)
+    {
+        llListenRemove(gListenHandle);
+        gListenHandle = -1;
+    }
+    gDialogPhase = PHASE_NONE;
+    return 0;
+}
+
+// ------------------ MENUS ------------------
+
+// Main shout menu: Venue / DJ / All / Cancel
+integer ShowMainMenu()
+{
+    EnsureListen();
+    gDialogPhase = PHASE_MAIN;
+
+    list buttons = ["Venue", "DJ", "All", "Cancel"];
+    llDialog(gHost, "Shout source:", buttons, CHANNEL_MENU);
+    Debug("Showing shout main menu.");
+    return 0;
+}
+
+// Venue shout menu with paging
+integer ShowVenueMenu()
+{
+    list labels = GetVenueLabels();
+    integer total = llGetListLength(labels);
+
+    if (total == 0)
+    {
+        llRegionSayTo(gHost, 0, "No shout_ entries found in the venue notecard.");
+        CloseListen();
+        return 0;
+    }
+
+    EnsureListen();
+    gDialogPhase = PHASE_VENUE;
+
+    integer perPage   = 7;
+    integer pageCount = (total + perPage - 1) / perPage;
+    if (pageCount < 1) pageCount = 1;
+
+    if (gVenuePage < 0) gVenuePage = 0;
+    if (gVenuePage > pageCount - 1) gVenuePage = pageCount - 1;
+
+    integer start = gVenuePage * perPage;
+    integer end   = start + perPage - 1;
+    if (end >= total) end = total - 1;
+
+    list buttons = llList2List(labels, start, end);
+
+    if (pageCount > 1)
+    {
+        if (gVenuePage > 0)
+        {
+            buttons += ["<< Prev"];
+        }
+        if (gVenuePage < pageCount - 1)
+        {
+            buttons += ["Next >>"];
+        }
+    }
+
+    buttons += ["Back", "Cancel"];
+
+    string title = "Venue shouts (Page " +
+                   (string)(gVenuePage + 1) + "/" +
+                   (string)pageCount + "):";
+
+    llDialog(gHost, title, buttons, CHANNEL_MENU);
+    Debug("Showing venue shout menu page " + (string)(gVenuePage + 1));
+    return 0;
+}
+
+// DJ shout menu with paging
+integer ShowDjMenu()
+{
+    list labels = GetDjLabels();
+    integer total = llGetListLength(labels);
+
+    if (total == 0)
+    {
+        llRegionSayTo(gHost, 0, "No shout_ entries found in the DJ notecard.");
+        CloseListen();
+        return 0;
+    }
+
+    EnsureListen();
+    gDialogPhase = PHASE_DJ;
+
+    integer perPage   = 7;
+    integer pageCount = (total + perPage - 1) / perPage;
+    if (pageCount < 1) pageCount = 1;
+
+    if (gDjPage < 0) gDjPage = 0;
+    if (gDjPage > pageCount - 1) gDjPage = pageCount - 1;
+
+    integer start = gDjPage * perPage;
+    integer end   = start + perPage - 1;
+    if (end >= total) end = total - 1;
+
+    list buttons = llList2List(labels, start, end);
+
+    if (pageCount > 1)
+    {
+        if (gDjPage > 0)
+        {
+            buttons += ["<< Prev"];
+        }
+        if (gDjPage < pageCount - 1)
+        {
+            buttons += ["Next >>"];
+        }
+    }
+
+    buttons += ["Back", "Cancel"];
+
+    string title = "DJ shouts (Page " +
+                   (string)(gDjPage + 1) + "/" +
+                   (string)pageCount + "):";
+
+    llDialog(gHost, title, buttons, CHANNEL_MENU);
+    Debug("Showing DJ shout menu page " + (string)(gDjPage + 1));
+    return 0;
+}
+
+// Combined menu with paging
+integer ShowAllMenu()
+{
+    list labels = GetAllLabels();
+    integer total = llGetListLength(labels);
+
+    if (total == 0)
+    {
+        llRegionSayTo(gHost, 0,
+            "No shout_ entries found in the current venue or DJ notecards.");
+        CloseListen();
+        return 0;
+    }
+
+    EnsureListen();
+    gDialogPhase = PHASE_ALL;
+
+    integer perPage   = 7;
+    integer pageCount = (total + perPage - 1) / perPage;
+    if (pageCount < 1) pageCount = 1;
+
+    if (gAllPage < 0) gAllPage = 0;
+    if (gAllPage > pageCount - 1) gAllPage = pageCount - 1;
+
+    integer start = gAllPage * perPage;
+    integer end   = start + perPage - 1;
+    if (end >= total) end = total - 1;
+
+    list buttons = llList2List(labels, start, end);
+
+    if (pageCount > 1)
+    {
+        if (gAllPage > 0)
+        {
+            buttons += ["<< Prev"];
+        }
+        if (gAllPage < pageCount - 1)
+        {
+            buttons += ["Next >>"];
+        }
+    }
+
+    buttons += ["Back", "Cancel"];
+
+    string title = "All shouts (Page " +
+                   (string)(gAllPage + 1) + "/" +
+                   (string)pageCount + "):";
+
+    llDialog(gHost, title, buttons, CHANNEL_MENU);
+    Debug("Showing ALL shout menu page " + (string)(gAllPage + 1));
+    return 0;
+}
+
+// ------------------ STATE ------------------
+
+default
+{
+    state_entry()
+    {
+        gOwner        = llGetOwner();
+        gOriginalName = llGetObjectName();
+        gHost         = gOwner;
+        llSetText("", <1.0, 1.0, 1.0>, 1.0);
+        Debug("ShoutEngine initialized. Original object name: " + gOriginalName);
+    }
+
+    changed(integer change)
+    {
+        if (change & CHANGED_OWNER)
+        {
+            gOwner = llGetOwner();
+            gHost  = gOwner;
+        }
+    }
+
+    link_message(integer sender_num, integer num, string configValue, key id)
+    {
+        // Debug mode toggle from Core
+        if (num == LM_DEBUG_MODE)
+        {
+            if (configValue == "ON")
+            {
+                gDebugMode = TRUE;
+            }
+            else if (configValue == "OFF")
+            {
+                gDebugMode = FALSE;
+            }
+
+            string modeStr = "OFF";
+            if (gDebugMode)
+            {
+                modeStr = "ON";
+            }
+            Debug("Debug mode now " + modeStr);
+            return;
+        }
+
+        if (num != LM_SHOUT_ENGINE)
+        {
+            return;
+        }
+
+        Debug("LM_SHOUT_ENGINE from #" + (string)sender_num +
+              " text='" + configValue + "' id=" + (string)id);
+
+        // Config reset from CORE when new notecards are loaded
+        if (configValue == "CFG_RESET")
+        {
+            gVenueShouts = [];
+            gDjShouts    = [];
+            gVenuePage   = 0;
+            gDjPage      = 0;
+            gAllPage     = 0;
+            Debug("CFG_RESET: cleared all shout config.");
+            return;
+        }
+
+        // Config lines: CFG|V|shout_name|value
+        if (llSubStringIndex(configValue, "CFG|") == 0)
+        {
+            list parts = llParseString2List(configValue, ["|"], []);
+            if (llGetListLength(parts) >= 4)
+            {
+                string source  = llList2String(parts, 1); // "V" or "D"
+                string keyName = llList2String(parts, 2);
+                string val     = llList2String(parts, 3);
+
+                if (source == "V")
+                {
+                    gVenueShouts = AddShout(gVenueShouts, keyName, val);
+                    Debug("Added venue shout config: " + keyName);
+                }
+                else if (source == "D")
+                {
+                    gDjShouts = AddShout(gDjShouts, keyName, val);
+                    Debug("Added DJ shout config: " + keyName);
+                }
+            }
+            return;
+        }
+
+        // Shout menu activation from CORE
+        if (configValue == "MENU")
+        {
+            if (id != NULL_KEY)
+            {
+                gHost = id;
+            }
+            else
+            {
+                gHost = gOwner;
+            }
+
+            gVenuePage = 0;
+            gDjPage    = 0;
+            gAllPage   = 0;
+
+            ShowMainMenu();
+            return;
+        }
+
+        // Otherwise treat as final message text (legacy behavior)
+        string messageText = configValue;
+        if (messageText == "")
+        {
+            Debug("Empty text; ignoring.");
+            return;
+        }
+
+        // If id is not NULL_KEY, treat as LOCAL SAY as owner
+        // (used by radar greets, socials, etc.).
+        if (id != NULL_KEY)
+        {
+            Debug("Treating as LOCAL SAY as owner (id != NULL_KEY).");
+            ShoutAsOwner(messageText, FALSE);
+        }
+        else
+        {
+            Debug("Treating as SHOUT on channel 0 as owner (id == NULL_KEY).");
+            ShoutAsOwner(messageText, TRUE);
+        }
+    }
+
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel != CHANNEL_MENU) return;
+        if (id != gHost)             return;
+
+        msg = llStringTrim(msg, STRING_TRIM);
+
+        // Main menu
+        if (gDialogPhase == PHASE_MAIN)
+        {
+            if (msg == "Cancel")
+            {
+                CloseListen();
+                return;
+            }
+            if (msg == "Venue")
+            {
+                gVenuePage = 0;
+                ShowVenueMenu();
+                return;
+            }
+            if (msg == "DJ")
+            {
+                gDjPage = 0;
+                ShowDjMenu();
+                return;
+            }
+            if (msg == "All")
+            {
+                gAllPage = 0;
+                ShowAllMenu();
+                return;
+            }
+            return;
+        }
+
+        // Venue menu
+        if (gDialogPhase == PHASE_VENUE)
+        {
+            if (msg == "Cancel")
+            {
+                CloseListen();
+                return;
+            }
+            if (msg == "Back")
+            {
+                ShowMainMenu();
+                return;
+            }
+            if (msg == "<< Prev")
+            {
+                gVenuePage = gVenuePage - 1;
+                ShowVenueMenu();
+                return;
+            }
+            if (msg == "Next >>")
+            {
+                gVenuePage = gVenuePage + 1;
+                ShowVenueMenu();
+                return;
+            }
+
+            string text = GetVenueText(msg);
+            if (text == "")
+            {
+                llRegionSayTo(gHost, 0,
+                    "No text configured for venue shout '" + msg + "'.");
+                return;
+            }
+
+            string shoutText = PickRandomVariant(text);
+            if (shoutText == "")
+            {
+                llRegionSayTo(gHost, 0,
+                    "The venue shout '" + msg + "' has no usable text after parsing variants.");
+                return;
+            }
+
+            Debug("Venue shout '" + msg + "' -> " + shoutText);
+            ShoutAsOwner(shoutText, TRUE);
+            return;
+        }
+
+        // DJ menu
+        if (gDialogPhase == PHASE_DJ)
+        {
+            if (msg == "Cancel")
+            {
+                CloseListen();
+                return;
+            }
+            if (msg == "Back")
+            {
+                ShowMainMenu();
+                return;
+            }
+            if (msg == "<< Prev")
+            {
+                gDjPage = gDjPage - 1;
+                ShowDjMenu();
+                return;
+            }
+            if (msg == "Next >>")
+            {
+                gDjPage = gDjPage + 1;
+                ShowDjMenu();
+                return;
+            }
+
+            string textDj = GetDjText(msg);
+            if (textDj == "")
+            {
+                llRegionSayTo(gHost, 0,
+                    "No text configured for DJ shout '" + msg + "'.");
+                return;
+            }
+
+            string shoutTextDj = PickRandomVariant(textDj);
+            if (shoutTextDj == "")
+            {
+                llRegionSayTo(gHost, 0,
+                    "The DJ shout '" + msg + "' has no usable text after parsing variants.");
+                return;
+            }
+
+            Debug("DJ shout '" + msg + "' -> " + shoutTextDj);
+            ShoutAsOwner(shoutTextDj, TRUE);
+            return;
+        }
+
+        // All menu
+        if (gDialogPhase == PHASE_ALL)
+        {
+            if (msg == "Cancel")
+            {
+                CloseListen();
+                return;
+            }
+            if (msg == "Back")
+            {
+                ShowMainMenu();
+                return;
+            }
+            if (msg == "<< Prev")
+            {
+                gAllPage = gAllPage - 1;
+                ShowAllMenu();
+                return;
+            }
+            if (msg == "Next >>")
+            {
+                gAllPage = gAllPage + 1;
+                ShowAllMenu();
+                return;
+            }
+
+            if (llStringLength(msg) < 3)
+            {
+                return;
+            }
+
+            string sourceTag = llGetSubString(msg, 0, 0);
+            string label     = llStringTrim(llGetSubString(msg, 2, -1), STRING_TRIM);
+
+            if (sourceTag == "V")
+            {
+                string textV = GetVenueText(label);
+                if (textV == "")
+                {
+                    llRegionSayTo(gHost, 0,
+                        "No text configured for venue shout '" + label + "'.");
+                    return;
+                }
+
+                string shoutTextV = PickRandomVariant(textV);
+                if (shoutTextV == "")
+                {
+                    llRegionSayTo(gHost, 0,
+                        "The venue shout '" + label + "' has no usable text after parsing variants.");
+                    return;
+                }
+
+                Debug("ALL menu venue shout '" + label + "' -> " + shoutTextV);
+                ShoutAsOwner(shoutTextV, TRUE);
+                return;
+            }
+
+            if (sourceTag == "D")
+            {
+                string textD = GetDjText(label);
+                if (textD == "")
+                {
+                    llRegionSayTo(gHost, 0,
+                        "No text configured for DJ shout '" + label + "'.");
+                    return;
+                }
+
+                string shoutTextD = PickRandomVariant(textD);
+                if (shoutTextD == "")
+                {
+                    llRegionSayTo(gHost, 0,
+                        "The DJ shout '" + label + "' has no usable text after parsing variants.");
+                    return;
+                }
+
+                Debug("ALL menu DJ shout '" + label + "' -> " + shoutTextD);
+                ShoutAsOwner(shoutTextD, TRUE);
+                return;
+            }
+            return;
+        }
+    }
+
+    on_rez(integer sp)
+    {
+        llResetScript();
+    }
+}
