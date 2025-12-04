@@ -1,0 +1,34 @@
+// =========================================================
+// Button.lsl - Generic HUD button script
+// =========================================================
+// Put this in each button prim. The prim's NAME is the label
+// sent to CORE. E.g. prim named "application", "venue", etc.
+// =========================================================
+
+string Trim(string s)
+{
+    return llStringTrim(s, STRING_TRIM);
+}
+
+default
+{
+    state_entry()
+    {
+        // Nothing special needed
+    }
+
+    touch_start(integer total_number)
+    {
+        key toucher = llDetectedKey(0);
+        if (toucher != llGetOwner()) return;
+
+        string label  = Trim(llGetObjectName());
+        if (label == "") return;
+
+        // Optional: local debug so you can see which button was pressed
+        llOwnerSay("[BTN] Touched button prim named '" + label + "', trimmed='" + label + "'");
+
+        // CORE listens for num==0 as "button pressed"
+        llMessageLinked(LINK_SET, 0, label, toucher);
+    }
+}
