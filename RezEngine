@@ -1,0 +1,456 @@
+// ========================================================= 
+// RezEngine.lsl - DanceBall + TipJar rezzing & cleanup
+// =========================================================
+
+integer LM_SHOUT_ENGINE = 1001; // not used here but kept for future
+integer LM_REZ_ENGINE   = 1003;
+integer LM_CONFIG_PASS  = 1008; // config from CORE (tipjar_pic, etc.)
+integer LM_DEBUG_MODE   = 1012;
+
+// HUD inventory object names
+string OBJ_DANCEBALL   = "dance ball";
+string OBJ_TIPJAR      = "tipjar";
+string CFG_TIPJAR_PIC  = "tipjar_pic";
+
+string gTipjarTexUUID  = "";   // resolved UUID or raw string from config
+
+// HUD owner
+key gHostID = NULL_KEY;
+
+// Debug flag
+integer gDebugMode = FALSE;
+
+// ---- Dance ball & tip jar channel tracking ----
+list gDanceBallChans = []; // each element: integer channel
+list gTipJarChans    = [];
+
+// ---- Follow/Stay/Cleanup menu ----
+integer DB_MENU_CHAN   = 0;
+integer DB_MENU_HANDLE = -1;
+integer gDbMenuActive  = FALSE;
+
+// Context: which button opened the menu
+integer CTX_NONE      = 0;
+integer CTX_DANCEBALL = 1;
+integer CTX_TIPJAR    = 2;
+
+integer gDbContext = 0;
+
+// ---------------- Helpers ----------------
+
+string Trim(string s)
+{
+    return llStringTrim(s, STRING_TRIM);
+}
+
+integer Debug(string msg)
+{
+    if (!gDebugMode) return FALSE;
+
+    key target = gHostID;
+    if (target == NULL_KEY)
+    {
+        target = llGetOwner();
+    }
+
+    if (target != NULL_KEY)
+    {
+        llRegionSayTo(target, 0, "[REZ DEBUG] " + msg);
+    }
+    return TRUE;
+}
+
+// Create a new private negative channel
+integer NewPrivateChannel()
+{
+    // Random negative between -1,000,000 and -2,000,000-ish
+    return (integer)((llFrand(1000000.0) * -1.0) - 1000000.0);
+}
+
+// Rez helper: generic object near avatar with given offset & start_param
+integer RezHUDObject(string itemName, vector relOffset, integer startParam)
+{
+    if (llGetInventoryType(itemName) != INVENTORY_OBJECT)
+    {
+        llRegionSayTo(
+            gHostID,
+            0,
+            "[Rez] No object named '" + itemName + "' found in the HUD inventory."
+        );
+        return FALSE;
+    }
+
+    key host = gHostID;
+    if (host == NULL_KEY)
+    {
+        host = llGetOwner();
+    }
+
+    list det = llGetObjectDetails(host, [OBJECT_POS, OBJECT_ROT]);
+    if (llGetListLength(det) < 2)
+    {
+        llRegionSayTo(
+            gHostID,
+            0,
+            "[Rez] Cannot find your position in the region."
+        );
+        return FALSE;
+    }
+
+    vector   pos = llList2Vector(det, 0);
+    rotation rot = llList2Rot(det, 1);
+
+    vector rezPos = pos + (relOffset * rot);
+
+    Debug(
+        "Rezzing '" + itemName + "' at " + (string)rezPos +
+        " start_param=" + (string)startParam
+    );
+
+    llRezAtRoot(itemName, rezPos, ZERO_VECTOR, rot, startParam);
+    return TRUE;
+}
+
+// Rez a dance ball and tell it FOLLOW/STAY
+integer RezDanceBall(integer followMode)
+{
+    integer chan = NewPrivateChannel();
+    gDanceBallChans += [chan];
+
+    // Above the avatar’s head
+    if (!RezHUDObject(OBJ_DANCEBALL, <0.0, 0.0, 3.0>, chan))
+    {
+        integer idx = llListFindList(gDanceBallChans, [chan]);
+        if (idx != -1)
+        {
+            gDanceBallChans = llDeleteSubList(gDanceBallChans, idx, idx);
+        }
+        return FALSE;
+    }
+
+    string modeMsg = "MODE|STAY";
+    if (followMode) modeMsg = "MODE|FOLLOW";
+
+    Debug(
+        "Dance ball channel " + (string)chan +
+        " -> " + modeMsg
+    );
+    llRegionSay(chan, modeMsg);
+    return TRUE;
+}
+
+// Rez a tip jar and tell it FOLLOW/STAY, rotated 90° on X
+integer RezTipJar(integer followMode)
+{
+    integer chan = NewPrivateChannel();
+    gTipJarChans += [chan];
+
+    // Figure out where the HUD owner is
+    key host = gHostID;
+    if (host == NULL_KEY)
+    {
+        host = llGetOwner();
+    }
+
+    list det = llGetObjectDetails(host, [OBJECT_POS, OBJECT_ROT]);
+    if (llGetListLength(det) < 2)
+    {
+        llRegionSayTo(
+            gHostID,
+            0,
+            "[Rez] Cannot find your position in the region for tip jar."
+        );
+        // remove the channel we just added
+        integer idx = llListFindList(gTipJarChans, [chan]);
+        if (idx != -1)
+        {
+            gTipJarChans = llDeleteSubList(gTipJarChans, idx, idx);
+        }
+        return FALSE;
+    }
+
+    vector   pos      = llList2Vector(det, 0);
+    rotation ownerRot = llList2Rot(det, 1);
+
+    // In front of avatar, slightly down
+    vector rezPos = pos + (<1.5, 0.0, -0.5> * ownerRot);
+
+    // Rotate the jar 90 degrees around X relative to the avatar
+    rotation rezRot = ownerRot * llEuler2Rot(<0.0, 0.0, PI / 2.0>);
+
+    Debug(
+        "Rezzing 'tipjar' at " + (string)rezPos +
+        " start_param=" + (string)chan
+    );
+    llRezAtRoot(OBJ_TIPJAR, rezPos, ZERO_VECTOR, rezRot, chan);
+
+    // Send follow/stay mode
+    string modeMsg = "MODE|STAY";
+    if (followMode) modeMsg = "MODE|FOLLOW";
+
+    Debug("Tip jar channel " + (string)chan + " -> " + modeMsg);
+    llRegionSay(chan, modeMsg);
+
+    // ---- Send texture if configured ----
+    if (gTipjarTexUUID != "")
+    {
+        string tex = gTipjarTexUUID;
+
+        // If the config looks like a *name*, try to resolve it
+        // from this HUD's inventory into a real UUID.
+        if (llGetInventoryType(tex) == INVENTORY_TEXTURE)
+        {
+            key k = llGetInventoryKey(tex);
+            if (k != NULL_KEY)
+            {
+                tex = (string)k;
+            }
+        }
+
+        Debug("Tip jar channel " + (string)chan + " -> SET_TEXTURE|" + tex);
+        llRegionSay(chan, "SET_TEXTURE|" + tex);
+    }
+
+    return TRUE;
+}
+
+// Cleanup all rezzed objects (both balls + jars)
+integer CleanupAllRezzed()
+{
+    integer i;
+    integer len;
+
+    // Dance balls
+    len = llGetListLength(gDanceBallChans);
+    i   = 0;
+    while (i < len)
+    {
+        integer ch = llList2Integer(gDanceBallChans, i);
+        llRegionSay(ch, "CLEANUP");
+        i++;
+    }
+    gDanceBallChans = [];
+
+    // Tip jars
+    len = llGetListLength(gTipJarChans);
+    i   = 0;
+    while (i < len)
+    {
+        integer ch2 = llList2Integer(gTipJarChans, i);
+        llRegionSay(ch2, "CLEANUP");
+        i++;
+    }
+    gTipJarChans = [];
+
+    Debug("CleanupAllRezzed: sent CLEANUP to all known dance balls and tip jars.");
+    return TRUE;
+}
+
+// ---- Follow / Stay / Clean up menu helpers ----
+
+integer CloseDanceBallMenu()
+{
+    if (DB_MENU_HANDLE != -1)
+    {
+        llListenRemove(DB_MENU_HANDLE);
+        DB_MENU_HANDLE = -1;
+    }
+    DB_MENU_CHAN  = 0;
+    gDbMenuActive = FALSE;
+    gDbContext    = CTX_NONE;
+    return 0;
+}
+
+integer OpenDanceBallMenu(integer context)
+{
+    CloseDanceBallMenu();
+
+    key target = gHostID;
+    if (target == NULL_KEY)
+    {
+        target = llGetOwner();
+    }
+    gHostID    = target;
+    gDbContext = context;
+
+    DB_MENU_CHAN   = (integer)((llFrand(1000000.0) * -1.0) - 1.0);
+    DB_MENU_HANDLE = llListen(DB_MENU_CHAN, "", target, "");
+    gDbMenuActive  = TRUE;
+
+    list buttons = ["Follow", "Stay", "Clean up", "Cancel"];
+
+    string title = "What would you like to do?";
+    if (context == CTX_DANCEBALL)      title = "Dance ball options:";
+    else if (context == CTX_TIPJAR)    title = "Tip jar options:";
+
+    llDialog(target, title, buttons, DB_MENU_CHAN);
+
+    Debug("Showing Follow/Stay/Clean up menu, context=" + (string)context);
+    return 0;
+}
+
+// =========================================================
+// STATE
+// =========================================================
+
+default
+{
+    state_entry()
+    {
+        gHostID         = llGetOwner();
+        gDebugMode      = FALSE;
+        gDanceBallChans = [];
+        gTipJarChans    = [];
+        gTipjarTexUUID  = "";        // reset
+        CloseDanceBallMenu();
+    }
+
+    on_rez(integer start_param)
+    {
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        if (change & (CHANGED_OWNER | CHANGED_INVENTORY))
+        {
+            llResetScript();
+        }
+    }
+
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        // Debug toggle from CORE
+        if (num == LM_DEBUG_MODE)
+        {
+            string s = llToLower(Trim(str));
+            if (s == "on")
+            {
+                gDebugMode = TRUE;
+                Debug("Debug mode ON.");
+            }
+            else if (s == "off")
+            {
+                Debug("Debug mode OFF.");
+                gDebugMode = FALSE;
+            }
+            return;
+        }
+
+        // Config from CORE (tipjar_pic)
+        if (num == LM_CONFIG_PASS)
+        {
+            list parts = llParseString2List(str, ["|"], []);
+            if (llGetListLength(parts) < 2) return;
+
+            string cfgKey      = Trim(llList2String(parts, 0));
+            string cfgKeyLower = llToLower(cfgKey);
+            string val         = Trim(llList2String(parts, 1));
+
+            if (cfgKeyLower == llToLower(CFG_TIPJAR_PIC))
+            {
+                gTipjarTexUUID = val;
+                Debug("tipjar_pic config received: " + val);
+            }
+            return;
+        }
+
+        if (num != LM_REZ_ENGINE) return;
+
+        string msg = Trim(str);
+
+        // Update host id from the sender id if provided
+        if (id != NULL_KEY) gHostID = id;
+        else                gHostID = llGetOwner();
+
+        // Dance animation relay
+        if (llSubStringIndex(msg, "DANCE_ANIM|") == 0)
+        {
+            integer len = llGetListLength(gDanceBallChans);
+            integer i   = 0;
+            while (i < len)
+            {
+                integer ch = llList2Integer(gDanceBallChans, i);
+                llRegionSay(ch, msg);
+                i++;
+            }
+            return;
+        }
+
+        if (msg == "DANCE_STOP")
+        {
+            integer len2 = llGetListLength(gDanceBallChans);
+            integer j    = 0;
+            while (j < len2)
+            {
+                integer ch2 = llList2Integer(gDanceBallChans, j);
+                llRegionSay(ch2, "DANCE_STOP");
+                j++;
+            }
+            gDanceBallChans = [];
+            return;
+        }
+
+        // Discoball HUD button
+        if (msg == "REZ_DANCEBALL")
+        {
+            Debug("REZ_DANCEBALL received; opening Follow/Stay/Clean up menu.");
+            OpenDanceBallMenu(CTX_DANCEBALL);
+            return;
+        }
+
+        // Tip jar HUD button
+        if (msg == "REZ_TIPJAR")
+        {
+            Debug("REZ_TIPJAR received; opening Follow/Stay/Clean up menu (tip jar).");
+            OpenDanceBallMenu(CTX_TIPJAR);
+            return;
+        }
+    }
+
+    listen(integer channel, string name, key id, string msg)
+    {
+        // Follow/Stay/Clean up menu
+        if (gDbMenuActive && channel == DB_MENU_CHAN && id == gHostID)
+        {
+            string choice = Trim(msg);
+
+            if (choice == "Cancel")
+            {
+                Debug("Follow/Stay menu cancelled.");
+                CloseDanceBallMenu();
+                return;
+            }
+
+            if (choice == "Clean up")
+            {
+                Debug("Menu: Clean up pressed; cleaning all rezzed objects.");
+                CleanupAllRezzed();
+                CloseDanceBallMenu();
+                return;
+            }
+
+            if (choice == "Follow")
+            {
+                Debug("Menu: Follow.");
+                if (gDbContext == CTX_DANCEBALL)      RezDanceBall(TRUE);
+                else if (gDbContext == CTX_TIPJAR)    RezTipJar(TRUE);
+                CloseDanceBallMenu();
+                return;
+            }
+
+            if (choice == "Stay")
+            {
+                Debug("Menu: Stay.");
+                if (gDbContext == CTX_DANCEBALL)      RezDanceBall(FALSE);
+                else if (gDbContext == CTX_TIPJAR)    RezTipJar(FALSE);
+                CloseDanceBallMenu();
+                return;
+            }
+
+            Debug("Follow/Stay menu unknown choice: " + choice);
+            CloseDanceBallMenu();
+            return;
+        }
+    }
+}
