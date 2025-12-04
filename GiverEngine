@@ -1,0 +1,873 @@
+// =========================================================
+// GiverEngine.lsl - Applications + Events
+// =========================================================
+//
+// CORE still sends on LM_REZ_ENGINE:
+//   "APP_MAIN_MENU"       (id = HUD owner avatar)
+//   "EVENTS_RAW|<config>" (id = HUD owner avatar)
+//
+// Config lines from CORE on LM_CONFIG_PASS:
+//   hostapp=..., djapp=..., dancerapp=..., oneapp=..., application=...
+//
+// Behavior:
+//
+//  APPLICATIONS:
+//   - APP_MAIN_MENU:
+//       * Scans avatars within 50m
+//       * Blue menu to choose recipient (paged)
+//       * Second menu to choose role: Host / DJ / Dancer / All
+//       * Gives inventory items first; if none exist, shouts text
+//         (with || variants) via ShoutEngine.
+//
+//  EVENTS:
+//   - "EVENTS_RAW|<config>":
+//       * If <config> matches any inventory item (any type), open
+//         nearby avatar chooser with "Send to everyone"
+//       * Otherwise treat as text and shout via ShoutEngine with || variants
+// =========================================================
+
+integer LM_SHOUT_ENGINE = 1001;
+integer LM_REZ_ENGINE   = 1003;
+integer LM_CONFIG_PASS  = 1008;
+integer LM_DEBUG_MODE   = 1012;
+
+// Dialog channel (shared for apps + events)
+integer APP_MENU_CHAN  = -99004;
+
+// Config keys
+string CFG_APPLICATION = "application";  // legacy / fallback
+string CFG_HOSTAPP     = "hostapp";
+string CFG_DJAPP       = "djapp";
+string CFG_DANCERAPP   = "dancerapp";
+string CFG_ONEAPP      = "oneapp";
+
+// Stored config values
+string gHostApp   = "";
+string gDjApp     = "";
+string gDancerApp = "";
+string gOneApp    = "";
+string gLegacyApp = "";
+
+// HUD owner
+key gHostID = NULL_KEY;
+
+// Recipient we are giving applications to
+key    gRecipientID   = NULL_KEY;
+string gRecipientName = "";
+
+// Events item name (if using inventory-mode)
+string gEventsItemName = "";
+
+// Debug + listen
+integer gDebugMode    = FALSE;
+integer gListenHandle = -1;
+
+// Nearby avatars (shared by app + events flows)
+list gNearbyAvNames;
+list gNearbyAvKeys;
+integer gAvPage = 0;
+
+// Phases for app menu flow
+integer APP_PHASE_NONE   = 0;
+integer APP_PHASE_TARGET = 1; // picking who to send app to
+integer APP_PHASE_ROLE   = 2; // picking which app role
+integer gAppPhase = 0;
+
+// Phases for events flow
+integer EV_PHASE_NONE   = 0;
+integer EV_PHASE_TARGET = 1; // picking who to send event item to
+integer gEvPhase = 0;
+
+// Paging sizes
+integer APP_AV_PAGE_SIZE = 9;
+integer EV_AV_PAGE_SIZE  = 8;
+
+// --------------- Helpers ----------------
+
+string Trim(string s)
+{
+    return llStringTrim(s, STRING_TRIM);
+}
+
+integer Debug(string msg)
+{
+    if (!gDebugMode) return FALSE;
+
+    key target = gHostID;
+    if (target == NULL_KEY)
+    {
+        target = llGetOwner();
+    }
+
+    if (target != NULL_KEY)
+    {
+        llRegionSayTo(target, 0, "[GIVER DEBUG] " + msg);
+    }
+    return TRUE;
+}
+
+// Random variant from "a||b||c"
+string PickRandomVariant(string text)
+{
+    list parts = llParseString2List(text, ["||"], []);
+    list clean = [];
+
+    integer len = llGetListLength(parts);
+    integer i   = 0;
+    while (i < len)
+    {
+        string s = Trim(llList2String(parts, i));
+        if (s != "") clean += [s];
+        i++;
+    }
+
+    len = llGetListLength(clean);
+    if (len == 0)  return Trim(text);
+    if (len == 1)  return llList2String(clean, 0);
+
+    integer idx = (integer)llFrand((float)len);
+    return llList2String(clean, idx);
+}
+
+// Split "item1,item2||item3" into list of non-empty items
+list SplitItems(string val)
+{
+    list raw = llParseString2List(val, [",", "||"], []);
+    list out = [];
+
+    integer len = llGetListLength(raw);
+    integer i = 0;
+    while (i < len)
+    {
+        string name = Trim(llList2String(raw, i));
+        if (name != "") out += [name];
+        i++;
+    }
+    return out;
+}
+
+// Give inventory items listed in tokens to target
+integer GiveTokensAsInventory(list tokens, key target)
+{
+    integer len = llGetListLength(tokens);
+    integer i   = 0;
+    integer foundAny = FALSE;
+
+    while (i < len)
+    {
+        string item = llList2String(tokens, i);
+
+        if (llGetInventoryType(item) != INVENTORY_NONE)
+        {
+            llGiveInventory(target, item);
+            foundAny = TRUE;
+        }
+        else
+        {
+            llRegionSayTo(
+                gHostID,
+                0,
+                "[Applications] No inventory item named '" + item +
+                "' found in the HUD."
+            );
+        }
+
+        i++;
+    }
+
+    return foundAny;
+}
+
+// Choose which config string to use for a single role
+string GetAppForRole(string role)
+{
+    role = llToLower(Trim(role));
+
+    if (role == "host"   && gHostApp   != "") return gHostApp;
+    if (role == "dj"     && gDjApp     != "") return gDjApp;
+    if (role == "dancer" && gDancerApp != "") return gDancerApp;
+
+    if (gLegacyApp != "") return gLegacyApp;
+    return "";
+}
+
+integer CloseListen()
+{
+    if (gListenHandle != -1)
+    {
+        llListenRemove(gListenHandle);
+        gListenHandle = -1;
+    }
+    return TRUE;
+}
+
+integer EnsureListen()
+{
+    if (gListenHandle != -1)
+    {
+        llListenRemove(gListenHandle);
+        gListenHandle = -1;
+    }
+
+    APP_MENU_CHAN = (integer)((llFrand(1000000.0) * -1.0) - 1.0);
+
+    key target = gHostID;
+    if (target == NULL_KEY)
+    {
+        target = llGetOwner();
+    }
+    gHostID = target;
+
+    gListenHandle = llListen(APP_MENU_CHAN, "", target, "");
+    return TRUE;
+}
+
+// Gather avatars within 50m of HUD owner
+integer GatherNearbyAvatars()
+{
+    gNearbyAvNames = [];
+    gNearbyAvKeys  = [];
+    gAvPage        = 0;
+
+    key owner = llGetOwner();
+    vector myPos = llGetPos();
+
+    list ids = llGetAgentList(AGENT_LIST_REGION, []);
+    integer len = llGetListLength(ids);
+    integer i   = 0;
+
+    while (i < len)
+    {
+        key k = llList2Key(ids, i);
+        if (k != owner)
+        {
+            list det = llGetObjectDetails(k, [OBJECT_POS, OBJECT_NAME]);
+            vector pos  = llList2Vector(det, 0);
+            string name = llList2String(det, 1);
+
+            if (llVecDist(myPos, pos) <= 50.0)
+            {
+                gNearbyAvNames += [name];
+                gNearbyAvKeys  += [k];
+            }
+        }
+        i++;
+    }
+
+    if (llGetListLength(gNearbyAvKeys) == 0) return FALSE;
+    return TRUE;
+}
+
+// ---------- Menus ----------
+
+integer ShowRecipientMenu()
+{
+    integer len = llGetListLength(gNearbyAvNames);
+    if (len == 0)
+    {
+        llRegionSayTo(
+            gHostID,
+            0,
+            "[Applications] Nobody within 50m to send applications to."
+        );
+        return FALSE;
+    }
+
+    list buttons;
+    string title;
+
+    if (len <= 11)
+    {
+        buttons = gNearbyAvNames + ["Cancel"];
+        title   = "Who should receive the application?";
+    }
+    else
+    {
+        integer perPage   = APP_AV_PAGE_SIZE;
+        integer pageCount = (len + perPage - 1) / perPage;
+
+        if (gAvPage < 0) gAvPage = 0;
+        if (gAvPage > pageCount - 1) gAvPage = pageCount - 1;
+
+        integer start = gAvPage * perPage;
+        integer end   = start + perPage - 1;
+        if (end >= len) end = len - 1;
+
+        buttons = llList2List(gNearbyAvNames, start, end);
+
+        if (gAvPage > 0)              buttons += ["<< Prev"];
+        if (gAvPage < pageCount - 1)  buttons += ["Next >>"];
+        buttons += ["Cancel"];
+
+        title = "Who should receive the application? (Page " +
+                 (string)(gAvPage + 1) + "/" +
+                 (string)pageCount + ")";
+    }
+
+    EnsureListen();
+    gAppPhase = APP_PHASE_TARGET;
+    gEvPhase  = EV_PHASE_NONE;
+
+    llDialog(gHostID, title, buttons, APP_MENU_CHAN);
+    Debug("Showing application recipient selection dialog.");
+    return TRUE;
+}
+
+integer ShowEventsRecipientMenu()
+{
+    integer len = llGetListLength(gNearbyAvNames);
+    if (len == 0)
+    {
+        llRegionSayTo(
+            gHostID,
+            0,
+            "[Events] Nobody within 50m to send the event item to."
+        );
+        return FALSE;
+    }
+
+    list buttons;
+    string title;
+
+    if (len <= 10)
+    {
+        buttons = gNearbyAvNames + ["Send to everyone", "Cancel"];
+        title   = "Who should receive the event item?";
+    }
+    else
+    {
+        integer perPage   = EV_AV_PAGE_SIZE;
+        integer pageCount = (len + perPage - 1) / perPage;
+
+        if (gAvPage < 0) gAvPage = 0;
+        if (gAvPage > pageCount - 1) gAvPage = pageCount - 1;
+
+        integer start = gAvPage * perPage;
+        integer end   = start + perPage - 1;
+        if (end >= len) end = len - 1;
+
+        buttons = llList2List(gNearbyAvNames, start, end);
+
+        if (gAvPage > 0)             buttons += ["<< Prev"];
+        if (gAvPage < pageCount - 1) buttons += ["Next >>"];
+        buttons += ["Send to everyone", "Cancel"];
+
+        title = "Who should receive the event item? (Page " +
+                 (string)(gAvPage + 1) + "/" +
+                 (string)pageCount + ")";
+    }
+
+    EnsureListen();
+    gEvPhase  = EV_PHASE_TARGET;
+    gAppPhase = APP_PHASE_NONE;
+
+    llDialog(gHostID, title, buttons, APP_MENU_CHAN);
+    Debug("Showing events recipient selection dialog.");
+    return TRUE;
+}
+
+// Application role menu
+integer ShowRoleMenu()
+{
+    list buttons;
+
+    if (gHostApp   != "" || gLegacyApp != "") buttons += ["Host"];
+    if (gDjApp     != "" || gLegacyApp != "") buttons += ["DJ"];
+    if (gDancerApp != "" || gLegacyApp != "") buttons += ["Dancer"];
+
+    if (gHostApp != "" || gDjApp != "" || gDancerApp != "" ||
+        gOneApp  != "" || gLegacyApp != "")
+    {
+        buttons += ["All"];
+    }
+
+    if (llGetListLength(buttons) == 0)
+    {
+        llRegionSayTo(
+            gHostID,
+            0,
+            "[Applications] No application items are configured in the venue notecard."
+        );
+        gAppPhase = APP_PHASE_NONE;
+        CloseListen();
+        return FALSE;
+    }
+
+    buttons += ["Cancel"];
+
+    EnsureListen();
+    gAppPhase = APP_PHASE_ROLE;
+    gEvPhase  = EV_PHASE_NONE;
+
+    string title = "Which application do you want to give to " + gRecipientName + "?";
+    llDialog(gHostID, title, buttons, APP_MENU_CHAN);
+    Debug("Showing APP_MAIN_MENU dialog for recipient: " + gRecipientName);
+    return TRUE;
+}
+
+// --------------- Events config handler ---------------
+
+integer HandleEventsConfig(string cfg)
+{
+    string val = Trim(cfg);
+    if (val == "")
+    {
+        llRegionSayTo(
+            gHostID,
+            0,
+            "[Events] No events config provided."
+        );
+        return FALSE;
+    }
+
+    integer type = llGetInventoryType(val);
+
+    // Inventory item mode
+    if (type != INVENTORY_NONE)
+    {
+        gEventsItemName = val;
+
+        integer found = GatherNearbyAvatars();
+        if (!found)
+        {
+            llRegionSayTo(
+                gHostID,
+                0,
+                "[Events] Nobody within 50m to send the event item to."
+            );
+            return FALSE;
+        }
+
+        ShowEventsRecipientMenu();
+        return TRUE;
+    }
+
+    // Text-mode shout
+    string shoutText = PickRandomVariant(val);
+    if (shoutText != "")
+    {
+        Debug("Events text fallback; shouting: " + shoutText);
+        llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, shoutText, NULL_KEY);
+    }
+    else
+    {
+        llRegionSayTo(
+            gHostID,
+            0,
+            "[Events] Events config text is empty."
+        );
+    }
+    return TRUE;
+}
+
+// --------------- State ---------------
+
+default
+{
+    state_entry()
+    {
+        gHostID = llGetOwner();
+        gDebugMode = FALSE;
+
+        gHostApp   = "";
+        gDjApp     = "";
+        gDancerApp = "";
+        gOneApp    = "";
+        gLegacyApp = "";
+
+        gRecipientID    = NULL_KEY;
+        gRecipientName  = "";
+        gEventsItemName = "";
+        gAppPhase       = APP_PHASE_NONE;
+        gEvPhase        = EV_PHASE_NONE;
+        gNearbyAvNames  = [];
+        gNearbyAvKeys   = [];
+        gAvPage         = 0;
+
+        CloseListen();
+
+        // Debug-only reset message, no more local spam
+        Debug("GiverEngine script reset and running.");
+    }
+
+    on_rez(integer sp)
+    {
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        if (change & (CHANGED_OWNER | CHANGED_INVENTORY))
+        {
+            llResetScript();
+        }
+    }
+
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        // Debug toggle
+        if (num == LM_DEBUG_MODE)
+        {
+            string s = llToLower(Trim(str));
+            if (s == "on")
+            {
+                gDebugMode = TRUE;
+                Debug("Debug mode ON.");
+            }
+            else if (s == "off")
+            {
+                Debug("Debug mode OFF.");
+                gDebugMode = FALSE;
+            }
+            return;
+        }
+
+        // Config from CORE: "key|value"
+        if (num == LM_CONFIG_PASS)
+        {
+            list parts = llParseString2List(str, ["|"], []);
+            if (llGetListLength(parts) < 2) return;
+
+            string cfgKey      = Trim(llList2String(parts, 0));
+            string cfgKeyLower = llToLower(cfgKey);
+            string val         = Trim(llList2String(parts, 1));
+
+            if (cfgKeyLower == CFG_HOSTAPP)
+            {
+                gHostApp = val;
+                Debug("hostapp = " + val);
+            }
+            else if (cfgKeyLower == CFG_DJAPP)
+            {
+                gDjApp = val;
+                Debug("djapp = " + val);
+            }
+            else if (cfgKeyLower == CFG_DANCERAPP)
+            {
+                gDancerApp = val;
+                Debug("dancerapp = " + val);
+            }
+            else if (cfgKeyLower == CFG_ONEAPP)
+            {
+                gOneApp = val;
+                Debug("oneapp = " + val);
+            }
+            else if (cfgKeyLower == CFG_APPLICATION)
+            {
+                gLegacyApp = val;
+                Debug("application (legacy) = " + val);
+            }
+            return;
+        }
+
+        // Application / Events control from CORE (same channel as RezEngine)
+        if (num == LM_REZ_ENGINE)
+        {
+            string msg = Trim(str);
+
+            if (id != NULL_KEY)
+            {
+                gHostID = id;
+            }
+            else
+            {
+                gHostID = llGetOwner();
+            }
+
+            if (msg == "APP_MAIN_MENU")
+            {
+                Debug("APP_MAIN_MENU received from CORE; starting recipient selection.");
+                integer found = GatherNearbyAvatars();
+                if (!found)
+                {
+                    llRegionSayTo(
+                        gHostID,
+                        0,
+                        "[Applications] Nobody within 50m to send applications to."
+                    );
+                    return;
+                }
+                ShowRecipientMenu();
+                return;
+            }
+
+            if (llSubStringIndex(msg, "EVENTS_RAW|") == 0)
+            {
+                string cfg = llGetSubString(msg, 11, -1);
+                Debug("EVENTS_RAW received: " + cfg);
+                HandleEventsConfig(cfg);
+                return;
+            }
+        }
+    }
+
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel != APP_MENU_CHAN) return;
+        if (id != gHostID)           return;
+
+        string choice = Trim(msg);
+
+        // Global cancel
+        if (choice == "Cancel")
+        {
+            gAppPhase       = APP_PHASE_NONE;
+            gEvPhase        = EV_PHASE_NONE;
+            gRecipientID    = NULL_KEY;
+            gRecipientName  = "";
+            gEventsItemName = "";
+            CloseListen();
+            return;
+        }
+
+        // -------- Application Phase: choose recipient --------
+        if (gAppPhase == APP_PHASE_TARGET)
+        {
+            if (choice == "<< Prev")
+            {
+                gAvPage--;
+                ShowRecipientMenu();
+                return;
+            }
+            if (choice == "Next >>")
+            {
+                gAvPage++;
+                ShowRecipientMenu();
+                return;
+            }
+
+            integer idx = llListFindList(gNearbyAvNames, [choice]);
+            if (idx == -1)
+            {
+                Debug("Unknown application recipient selection: " + choice);
+                ShowRecipientMenu();
+                return;
+            }
+
+            gRecipientName = choice;
+            gRecipientID   = llList2Key(gNearbyAvKeys, idx);
+            Debug("Application recipient: " + gRecipientName + " (" + (string)gRecipientID + ")");
+
+            ShowRoleMenu();
+            return;
+        }
+
+        // -------- Application Phase: choose role --------
+        if (gAppPhase == APP_PHASE_ROLE)
+        {
+            string role = "";
+
+            if (choice == "Host")   role = "host";
+            else if (choice == "DJ")     role = "dj";
+            else if (choice == "Dancer") role = "dancer";
+            else if (choice == "All")    role = "all";
+
+            if (role == "")
+            {
+                Debug("Unknown role selection: " + choice);
+                gAppPhase = APP_PHASE_NONE;
+                CloseListen();
+                return;
+            }
+
+            // ALL roles combined
+            if (role == "all")
+            {
+                list allTokens = [];
+
+                if (gHostApp   != "") allTokens += SplitItems(gHostApp);
+                if (gDjApp     != "") allTokens += SplitItems(gDjApp);
+                if (gDancerApp != "") allTokens += SplitItems(gDancerApp);
+                if (gOneApp    != "") allTokens += SplitItems(gOneApp);
+                if (gLegacyApp != "") allTokens += SplitItems(gLegacyApp);
+
+                integer foundAny = FALSE;
+                if (llGetListLength(allTokens) > 0)
+                {
+                    foundAny = GiveTokensAsInventory(allTokens, gRecipientID);
+                }
+
+                if (!foundAny)
+                {
+                    string combinedText = "";
+
+                    if (gHostApp != "")
+                    {
+                        if (combinedText != "") combinedText += "||";
+                        combinedText += gHostApp;
+                    }
+                    if (gDjApp != "")
+                    {
+                        if (combinedText != "") combinedText += "||";
+                        combinedText += gDjApp;
+                    }
+                    if (gDancerApp != "")
+                    {
+                        if (combinedText != "") combinedText += "||";
+                        combinedText += gDancerApp;
+                    }
+                    if (gOneApp != "")
+                    {
+                        if (combinedText != "") combinedText += "||";
+                        combinedText += gOneApp;
+                    }
+                    if (gLegacyApp != "")
+                    {
+                        if (combinedText != "") combinedText += "||";
+                        combinedText += gLegacyApp;
+                    }
+
+                    combinedText = Trim(combinedText);
+
+                    if (combinedText != "")
+                    {
+                        string shoutText = PickRandomVariant(combinedText);
+                        Debug("No inventory for All; shouting text: " + shoutText);
+                        llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, shoutText, NULL_KEY);
+                    }
+                    else
+                    {
+                        llRegionSayTo(
+                            gHostID,
+                            0,
+                            "[Applications] No application items are configured for All."
+                        );
+                    }
+                }
+                else
+                {
+                    Debug("Giving All application(s) to " + gRecipientName);
+                }
+
+                gAppPhase = APP_PHASE_NONE;
+                CloseListen();
+                return;
+            }
+
+            // Single role
+            string appStr = GetAppForRole(role);
+            if (appStr == "")
+            {
+                llRegionSayTo(
+                    gHostID,
+                    0,
+                    "[Applications] No application configured for " + choice + "."
+                );
+                gAppPhase = APP_PHASE_NONE;
+                CloseListen();
+                return;
+            }
+
+            list items = SplitItems(appStr);
+            integer foundAnyRole = FALSE;
+
+            if (llGetListLength(items) > 0)
+            {
+                foundAnyRole = GiveTokensAsInventory(items, gRecipientID);
+            }
+
+            if (!foundAnyRole)
+            {
+                string shoutTextRole = PickRandomVariant(appStr);
+                if (shoutTextRole != "")
+                {
+                    Debug("No inventory for " + choice + "; shouting text: " + shoutTextRole);
+                    llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, shoutTextRole, NULL_KEY);
+                }
+                else
+                {
+                    llRegionSayTo(
+                        gHostID,
+                        0,
+                        "[Applications] Application config for " + choice + " is empty."
+                    );
+                }
+            }
+            else
+            {
+                Debug("Giving " + choice + " application(s) to " + gRecipientName);
+            }
+
+            gAppPhase = APP_PHASE_NONE;
+            CloseListen();
+            return;
+        }
+
+        // -------- Events Phase: choose recipient(s) --------
+        if (gEvPhase == EV_PHASE_TARGET)
+        {
+            if (choice == "<< Prev")
+            {
+                gAvPage--;
+                ShowEventsRecipientMenu();
+                return;
+            }
+            if (choice == "Next >>")
+            {
+                gAvPage++;
+                ShowEventsRecipientMenu();
+                return;
+            }
+
+            if (choice == "Send to everyone")
+            {
+                if (gEventsItemName != "" &&
+                    llGetInventoryType(gEventsItemName) != INVENTORY_NONE)
+                {
+                    integer len2 = llGetListLength(gNearbyAvKeys);
+                    integer j    = 0;
+                    while (j < len2)
+                    {
+                        key k = llList2Key(gNearbyAvKeys, j);
+                        llGiveInventory(k, gEventsItemName);
+                        j++;
+                    }
+                    Debug("Events item '" + gEventsItemName + "' sent to everyone in range.");
+                }
+                else
+                {
+                    llRegionSayTo(
+                        gHostID,
+                        0,
+                        "[Events] Event item '" + gEventsItemName + "' is no longer in the HUD inventory."
+                    );
+                }
+
+                gEvPhase        = EV_PHASE_NONE;
+                gEventsItemName = "";
+                CloseListen();
+                return;
+            }
+
+            integer idxEv = llListFindList(gNearbyAvNames, [choice]);
+            if (idxEv == -1)
+            {
+                Debug("Unknown events recipient selection: " + choice);
+                ShowEventsRecipientMenu();
+                return;
+            }
+
+            key targetAv = llList2Key(gNearbyAvKeys, idxEv);
+
+            if (gEventsItemName != "" &&
+                llGetInventoryType(gEventsItemName) != INVENTORY_NONE)
+            {
+                llGiveInventory(targetAv, gEventsItemName);
+                Debug("Events item '" + gEventsItemName + "' sent to " + choice);
+            }
+            else
+            {
+                llRegionSayTo(
+                    gHostID,
+                    0,
+                    "[Events] Event item '" + gEventsItemName + "' is no longer in the HUD inventory."
+                );
+            }
+
+            gEvPhase        = EV_PHASE_NONE;
+            gEventsItemName = "";
+            CloseListen();
+            return;
+        }
+    }
+}
