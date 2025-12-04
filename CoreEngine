@@ -1,0 +1,1267 @@
+// ========================================================= 
+// CORE.LSL — Master Controller Script with Debug Toggle
+// =========================================================
+
+// -------------------- CONSTANTS -------------------------
+integer CHANNEL_MENU = -99000;
+
+// Link Message Channels
+integer LM_SHOUT_ENGINE   = 1001;
+integer LM_CONTACT_ENGINE = 1002;
+integer LM_REZ_ENGINE     = 1003;
+integer LM_DANCE_ENGINE   = 1004;
+integer LM_EMOTE_ENGINE   = 1005;
+integer LM_RADAR_ENGINE   = 1006;
+integer LM_TIMER_ENGINE   = 1007;
+integer LM_CONFIG_PASS    = 1008;
+integer LM_SOCIALS_ENGINE = 1009;
+integer LM_GESTURE_ENGINE = 1010;
+integer LM_CORE_READY     = 1011;
+integer LM_DEBUG_MODE     = 1012; // global debug on/off
+integer LM_DUMP_BRIDGE    = 1013;
+integer LM_HUD_DISPLAY    = 1015; // text + minimize handled by HUD_Display.lsl
+integer LM_NOTICE_ENGINE  = 1016; // NoticeEngine notecards
+
+// Notecard prefixes
+string NC_VENUE_PREFIX = "venue_";
+string NC_DJ_PREFIX    = "dj_";
+
+// Dialog phases
+integer PHASE_NONE  = 0;
+integer PHASE_VENUE = 1;
+integer PHASE_DJ    = 2;
+
+// Config keys
+string CFG_GREET           = "greet";
+string CFG_GREET_BLACKLIST = "greet_blacklist";
+string CFG_TIMER_MINS      = "timer_mins";
+string CFG_SETLENGTH       = "setlength";
+string CFG_APPLICATION     = "application";
+string CFG_HOSTAPP         = "hostapp";
+string CFG_DJAPP           = "djapp";
+string CFG_DANCERAPP       = "dancerapp";
+string CFG_ONEAPP          = "oneapp";
+string CFG_TIPJAR_PIC      = "tipjar_pic"; // <-- NEW
+
+// Dialog paging
+integer DIALOG_PAGE_SIZE = 9; // labels per page when paging
+
+// -------------------- GLOBALS ---------------------------
+
+// Notecard discovery
+list gVenueNotecards;
+list gDjNotecards;
+list gVenueLabels;
+list gDjLabels;
+
+// Parsed configuration [key, value, key, value, ...]
+list gVenueConfig;
+list gDjConfig;
+
+string gSelectedVenueCard  = "";
+string gSelectedDjCard     = "";
+string gSelectedVenueLabel = "";
+string gSelectedDjLabel    = "";
+
+// Names from config
+string gVenueName = "";
+string gDjName    = "";
+
+// Status
+integer gConfigReady   = FALSE;
+integer gDialogPhase   = PHASE_NONE;
+integer gListenHandle  = -1;
+
+// Notecard loading
+integer gLoadStage     = 0;     // 0 = idle, 1 = venue, 2 = dj
+string  gCurrentCard   = "";
+integer gCurrentLine   = 0;
+key     gCurrentQuery  = NULL_KEY;
+
+// Owner
+key     gHostID;
+
+// Text prim (legacy; now HUD_Display handles text)
+integer gTextPrimLink = 0;
+
+// Debug flag
+integer gDebugMode = FALSE;  // global debug mode
+
+// Paging state for Venue/DJ menus
+integer gVenuePage = 0;
+integer gDjPage    = 0;
+
+// -------------------- HELPERS ---------------------------
+
+integer Debug(string msg)
+{
+    if (gDebugMode && gHostID != NULL_KEY)
+    {
+        llRegionSayTo(gHostID, 0, "[CORE DEBUG] " + msg);
+    }
+    return 0;
+}
+
+integer FindTextPrim()
+{
+    gTextPrimLink = 0;
+    integer count = llGetNumberOfPrims();
+    integer i = 1;
+    while (i <= count)
+    {
+        if (llGetLinkName(i) == "Text prim")
+        {
+            gTextPrimLink = i;
+        }
+        i = i + 1;
+    }
+    return gTextPrimLink;
+}
+
+// Text is now owned by HUD_Display.lsl.
+// This just forwards the text to that script.
+integer HUDSetText(string msg)
+{
+    llMessageLinked(LINK_SET, LM_HUD_DISPLAY, msg, NULL_KEY);
+    return 0;
+}
+
+list ScanNotecards(string prefix)
+{
+    list result = [];
+    integer total = llGetInventoryNumber(INVENTORY_NOTECARD);
+    integer i = 0;
+    while (i < total)
+    {
+        string name = llGetInventoryName(INVENTORY_NOTECARD, i);
+        if (llSubStringIndex(name, prefix) == 0)
+        {
+            result += [name];
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+string MakeLabelFromCardName(string name, string prefix)
+{
+    integer plen = llStringLength(prefix);
+    string label = name;
+
+    // Strip prefix
+    if (llToLower(llGetSubString(name, 0, plen - 1)) == llToLower(prefix))
+    {
+        label = llGetSubString(name, plen, -1);
+    }
+
+    // Optionally strip trailing "template"
+    string lower  = llToLower(label);
+    integer pos   = llSubStringIndex(lower, "template");
+    if (pos != -1)
+    {
+        label = llGetSubString(label, 0, pos - 1);
+    }
+
+    return label;
+}
+
+// Return value for key (case-insensitive) from [k,v,k,v,...] list
+string GetConfigValue(list cfg, string keyName)
+{
+    integer len = llGetListLength(cfg);
+    integer i = 0;
+    while (i < len)
+    {
+        string k = llList2String(cfg, i);
+        if (llToLower(k) == llToLower(keyName))
+        {
+            return llList2String(cfg, i + 1);
+        }
+        i = i + 2;
+    }
+    return "";
+}
+
+// Only keep keys CORE actually needs, to avoid stack/heap collisions
+integer ShouldKeepKey(string keyName)
+{
+    string k = llToLower(llStringTrim(keyName, STRING_TRIM));
+
+    // Names / identity
+    if (k == "venue_name") return TRUE;
+    if (k == "dj_name")    return TRUE;
+
+    // Hidden greet
+    if (k == "greet")           return TRUE;
+    if (k == "greet_blacklist") return TRUE;
+
+    // Timer / setlength
+    if (k == "timer_mins") return TRUE;
+    if (k == "setlength")  return TRUE;
+
+    // Application giver
+    if (k == "application") return TRUE;
+    if (k == "hostapp")     return TRUE;
+    if (k == "djapp")       return TRUE;
+    if (k == "dancerapp")   return TRUE;
+    if (k == "oneapp")      return TRUE;
+
+    // Tip jar picture (per-venue)
+    if (k == "tipjar_pic")  return TRUE; // <-- NEW
+
+    // Contacts
+    if (k == "manager")  return TRUE;
+    if (k == "security") return TRUE;
+
+    // Socials / group / primfeed
+    if (k == "group")    return TRUE;
+    if (k == "discord")  return TRUE;
+    if (k == "facebook") return TRUE;
+    if (k == "twitch")   return TRUE;
+    if (k == "primfeed") return TRUE;
+
+    // Events / reminders / record
+    if (k == "events")    return TRUE;
+    if (k == "tipremind") return TRUE;
+    if (k == "record")    return TRUE;
+
+    // Icon buttons
+    if (k == "heart")     return TRUE;
+    if (k == "coin")      return TRUE;
+    if (k == "musicnote") return TRUE;
+
+    // Gestures / Emotes
+    if (llSubStringIndex(k, "gest_") == 0)  return TRUE;
+    if (llSubStringIndex(k, "emote_") == 0) return TRUE;
+
+    // shout_* are handled by ShoutEngine, not CORE
+    return FALSE;
+}
+
+// Given a raw config string, split on "||" and pick a random non-empty trimmed entry.
+string PickRandomVariant(string raw)
+{
+    list parts = llParseString2List(raw, ["||"], []);
+
+    list clean = [];
+    integer i = 0;
+    integer len = llGetListLength(parts);
+    while (i < len)
+    {
+        string s = llStringTrim(llList2String(parts, i), STRING_TRIM);
+        if (s != "")
+        {
+            clean += [s];
+        }
+        i = i + 1;
+    }
+
+    len = llGetListLength(clean);
+    if (len == 0) return "";
+    if (len == 1) return llList2String(clean, 0);
+
+    integer idx = (integer)llFrand((float)len);
+    return llList2String(clean, idx);
+}
+
+integer StartVenueLoad()
+{
+    gLoadStage    = 1;
+    gCurrentCard  = gSelectedVenueCard;
+    gCurrentLine  = 0;
+    gCurrentQuery = llGetNotecardLine(gCurrentCard, gCurrentLine);
+    HUDSetText("[##--------] Loading venue config...");
+    Debug("Loading venue notecard: " + gCurrentCard);
+    return 0;
+}
+
+integer StartDjLoad()
+{
+    gLoadStage    = 2;
+    gCurrentCard  = gSelectedDjCard;
+    gCurrentLine  = 0;
+    gCurrentQuery = llGetNotecardLine(gCurrentCard, gCurrentLine);
+    HUDSetText("[######----] Loading DJ config...");
+    Debug("Loading DJ notecard: " + gCurrentCard);
+    return 0;
+}
+
+integer FinalizeConfig()
+{
+    gConfigReady = TRUE;
+
+    gVenueName = GetConfigValue(gVenueConfig, "venue_name");
+    if (gVenueName == "") gVenueName = gSelectedVenueLabel;
+
+    gDjName = GetConfigValue(gDjConfig, "dj_name");
+    if (gDjName == "") gDjName = gSelectedDjLabel;
+
+    Debug("Configuration complete (venue + DJ).");
+    HUDSetText("Venue: " + gVenueName + " and DJ: " + gDjName);
+
+    // Hidden greet
+    string greet = GetConfigValue(gVenueConfig, CFG_GREET);
+    if (greet != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_GREET + "|" + greet,
+            NULL_KEY
+        );
+    }
+
+    string greetBlacklist = GetConfigValue(gVenueConfig, CFG_GREET_BLACKLIST);
+    if (greetBlacklist != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_GREET_BLACKLIST + "|" + greetBlacklist,
+            NULL_KEY
+        );
+    }
+
+    // Timer / setlength
+    string timerMins = GetConfigValue(gVenueConfig, CFG_TIMER_MINS);
+    if (timerMins != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_TIMER_MINS + "|" + timerMins,
+            NULL_KEY
+        );
+    }
+
+    string setLength = GetConfigValue(gVenueConfig, CFG_SETLENGTH);
+    if (setLength != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_SETLENGTH + "|" + setLength,
+            NULL_KEY
+        );
+    }
+
+    // Application giver
+    string appNC = GetConfigValue(gVenueConfig, CFG_APPLICATION);
+    if (appNC != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_APPLICATION + "|" + appNC,
+            NULL_KEY
+        );
+    }
+
+    string hostApp = GetConfigValue(gVenueConfig, CFG_HOSTAPP);
+    if (hostApp != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_HOSTAPP + "|" + hostApp,
+            NULL_KEY
+        );
+    }
+
+    string djApp = GetConfigValue(gVenueConfig, CFG_DJAPP);
+    if (djApp != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_DJAPP + "|" + djApp,
+            NULL_KEY
+        );
+    }
+
+    string dancerApp = GetConfigValue(gVenueConfig, CFG_DANCERAPP);
+    if (dancerApp != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_DANCERAPP + "|" + dancerApp,
+            NULL_KEY
+        );
+    }
+
+    string oneApp = GetConfigValue(gVenueConfig, CFG_ONEAPP);
+    if (oneApp != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_ONEAPP + "|" + oneApp,
+            NULL_KEY
+        );
+    }
+
+    // ---- NEW: Tip jar picture (venue first, then DJ as fallback) ----
+    string tipPic = GetConfigValue(gVenueConfig, CFG_TIPJAR_PIC);
+    if (tipPic == "") tipPic = GetConfigValue(gDjConfig, CFG_TIPJAR_PIC);
+
+    if (tipPic != "")
+    {
+        llMessageLinked(
+            LINK_SET,
+            LM_CONFIG_PASS,
+            CFG_TIPJAR_PIC + "|" + tipPic,
+            NULL_KEY
+        );
+    }
+
+    // Notify others that core is ready
+    llMessageLinked(LINK_SET, LM_CORE_READY, "CORE_READY", gHostID);
+
+    // Let NoticeEngine know config is ready (for @VENUE_NAME@ etc.)
+    llMessageLinked(LINK_SET, LM_NOTICE_ENGINE, "CFG_READY", gHostID);
+
+    // Let SocialsEngine know config is ready as well (for @DJ_*@, @VENUE_*@ etc.)
+    llMessageLinked(LINK_SET, LM_SOCIALS_ENGINE, "CFG_READY", gHostID);
+
+    return 0;
+}
+
+// Build gestures payload from keys gest_* in venue/dj config
+string BuildGesturesPayload()
+{
+    list items = ["GESTURES"];
+
+    integer len = llGetListLength(gVenueConfig);
+    integer i = 0;
+    while (i < len)
+    {
+        string k = llList2String(gVenueConfig, i);
+        string v = llList2String(gVenueConfig, i + 1);
+        if (v != "")
+        {
+            string lowerKey = llToLower(k);
+            if (llSubStringIndex(lowerKey, "gest_") == 0)
+            {
+                string rawLabel = llGetSubString(k, 5, -1);
+                rawLabel = llStringTrim(rawLabel, STRING_TRIM);
+
+                string label;
+                if (rawLabel != "")
+                {
+                    label = llToUpper(llGetSubString(rawLabel, 0, 0)) +
+                            llToLower(llGetSubString(rawLabel, 1, -1));
+                }
+                else
+                {
+                    label = "Gesture";
+                }
+
+                items += [label + "=" + v];
+            }
+        }
+        i = i + 2;
+    }
+
+    len = llGetListLength(gDjConfig);
+    i = 0;
+    while (i < len)
+    {
+        string k2 = llList2String(gDjConfig, i);
+        string v2 = llList2String(gDjConfig, i + 1);
+        if (v2 != "")
+        {
+            string lowerKey2 = llToLower(k2);
+            if (llSubStringIndex(lowerKey2, "gest_") == 0)
+            {
+                string rawLabel2 = llGetSubString(k2, 5, -1);
+                rawLabel2 = llStringTrim(rawLabel2, STRING_TRIM);
+
+                string label2;
+                if (rawLabel2 != "")
+                {
+                    label2 = llToUpper(llGetSubString(rawLabel2, 0, 0)) +
+                             llToLower(llGetSubString(rawLabel2, 1, -1));
+                }
+                else
+                {
+                    label2 = "Gesture";
+                }
+
+                items += [label2 + "=" + v2];
+            }
+        }
+        i = i + 2;
+    }
+
+    return llDumpList2String(items, "|");
+}
+
+// Build emotes payload from keys emote_* in venue/dj config
+string BuildEmotesPayload()
+{
+    list items = ["EMOTES"];
+
+    integer len = llGetListLength(gVenueConfig);
+    integer i = 0;
+    while (i < len)
+    {
+        string k = llList2String(gVenueConfig, i);
+        string v = llList2String(gVenueConfig, i + 1);
+        if (v != "")
+        {
+            string lowerKey = llToLower(k);
+            if (llSubStringIndex(lowerKey, "emote_") == 0)
+            {
+                string rawLabel = llGetSubString(k, 6, -1);
+                rawLabel = llStringTrim(rawLabel, STRING_TRIM);
+
+                string label;
+                if (rawLabel != "")
+                {
+                    label = llToUpper(llGetSubString(rawLabel, 0, 0)) +
+                            llToLower(llGetSubString(rawLabel, 1, -1));
+                }
+                else
+                {
+                    label = "Emote";
+                }
+
+                items += [label + "=" + v];
+            }
+        }
+        i = i + 2;
+    }
+
+    len = llGetListLength(gDjConfig);
+    i = 0;
+    while (i < len)
+    {
+        string k2 = llList2String(gDjConfig, i);
+        string v2 = llList2String(gDjConfig, i + 1);
+        if (v2 != "")
+        {
+            string lowerKey2 = llToLower(k2);
+            if (llSubStringIndex(lowerKey2, "emote_") == 0)
+            {
+                string rawLabel2 = llGetSubString(k2, 6, -1);
+                rawLabel2 = llStringTrim(rawLabel2, STRING_TRIM);
+
+                string label2;
+                if (rawLabel2 != "")
+                {
+                    label2 = llToUpper(llGetSubString(rawLabel2, 0, 0)) +
+                             llToLower(llGetSubString(rawLabel2, 1, -1));
+                }
+                else
+                {
+                    label2 = "Emote";
+                }
+
+                items += [label2 + "=" + v2];
+            }
+        }
+        i = i + 2;
+    }
+
+    return llDumpList2String(items, "|");
+}
+
+// -------- Paged Venue / DJ dialogs --------
+
+integer ShowVenueDialog()
+{
+    integer len = llGetListLength(gVenueLabels);
+    if (len == 0)
+    {
+        llOwnerSay("[CORE] No venue notecards found.");
+        return 0;
+    }
+
+    list buttons;
+    string title;
+
+    if (len <= 11)
+    {
+        buttons = gVenueLabels + ["Cancel"];
+        title   = "Select a Venue:";
+    }
+    else
+    {
+        integer perPage   = DIALOG_PAGE_SIZE;
+        integer pageCount = (len + perPage - 1) / perPage;
+
+        if (gVenuePage < 0) gVenuePage = 0;
+        if (gVenuePage > pageCount - 1) gVenuePage = pageCount - 1;
+
+        integer start = gVenuePage * perPage;
+        integer end   = start + perPage - 1;
+        if (end >= len) end = len - 1;
+
+        buttons = llList2List(gVenueLabels, start, end);
+
+        if (gVenuePage > 0)
+        {
+            buttons += ["<< Prev"];
+        }
+        if (gVenuePage < pageCount - 1)
+        {
+            buttons += ["Next >>"];
+        }
+        buttons += ["Cancel"];
+
+        title = "Select a Venue (Page " +
+                 (string)(gVenuePage + 1) + "/" +
+                 (string)pageCount + "):";
+    }
+
+    llDialog(gHostID, title, buttons, CHANNEL_MENU);
+    return 0;
+}
+
+integer ShowDjDialog()
+{
+    integer len = llGetListLength(gDjLabels);
+    if (len == 0)
+    {
+        llOwnerSay("[CORE] No DJ notecards found.");
+        return 0;
+    }
+
+    list buttons;
+    string title;
+
+    if (len <= 11)
+    {
+        buttons = gDjLabels + ["Cancel"];
+        title   = "Select a DJ:";
+    }
+    else
+    {
+        integer perPage   = DIALOG_PAGE_SIZE;
+        integer pageCount = (len + perPage - 1) / perPage;
+
+        if (gDjPage < 0) gDjPage = 0;
+        if (gDjPage > pageCount - 1) gDjPage = pageCount - 1;
+
+        integer start = gDjPage * perPage;
+        integer end   = start + perPage - 1;
+        if (end >= len) end = len - 1;
+
+        buttons = llList2List(gDjLabels, start, end);
+
+        if (gDjPage > 0)
+        {
+            buttons += ["<< Prev"];
+        }
+        if (gDjPage < pageCount - 1)
+        {
+            buttons += ["Next >>"];
+        }
+        buttons += ["Cancel"];
+
+        title = "Select a DJ (Page " +
+                 (string)(gDjPage + 1) + "/" +
+                 (string)pageCount + "):";
+    }
+
+    llDialog(gHostID, title, buttons, CHANNEL_MENU);
+    return 0;
+}
+
+// ========================================================
+// DEFAULT STATE
+// ========================================================
+
+default
+{
+    state_entry()
+    {
+        gHostID = llGetOwner();
+        FindTextPrim(); // harmless even though HUD_Display now owns text
+
+        if (!gConfigReady)
+        {
+            HUDSetText("Host HUD: waiting for configuration...");
+
+            // Single user-facing startup line:
+            llOwnerSay("Hello Mortal!! Host HUD is initialized. Press the 'Venue' button on the HUD to select configuration.");
+
+            // Debug-only detail:
+            Debug("Host HUD initialized. Scanning for notecards...");
+        }
+        else
+        {
+            HUDSetText("Venue: " + gVenueName + " and DJ: " + gDjName);
+        }
+
+        gVenueNotecards = ScanNotecards(NC_VENUE_PREFIX);
+        gDjNotecards    = ScanNotecards(NC_DJ_PREFIX);
+
+        integer vn = llGetListLength(gVenueNotecards);
+        integer dn = llGetListLength(gDjNotecards);
+
+        gVenueLabels = [];
+        gDjLabels    = [];
+
+        integer i = 0;
+        while (i < vn)
+        {
+            string card = llList2String(gVenueNotecards, i);
+            gVenueLabels += [MakeLabelFromCardName(card, NC_VENUE_PREFIX)];
+            i = i + 1;
+        }
+
+        i = 0;
+        while (i < dn)
+        {
+            string card2 = llList2String(gDjNotecards, i);
+            gDjLabels += [MakeLabelFromCardName(card2, NC_DJ_PREFIX)];
+            i = i + 1;
+        }
+
+        // Debug-only info about card discovery:
+        Debug("Venue cards found: " + (string)vn);
+        Debug("DJ cards found: " + (string)dn);
+    }
+
+    on_rez(integer sp)
+    {
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        if (change & (CHANGED_OWNER | CHANGED_INVENTORY))
+        {
+            llResetScript();
+        }
+    }
+
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        // Only treat num==0 as "button pressed" messages
+        if (num != 0) return;
+
+        string prefix = llStringTrim(str, STRING_TRIM);
+        string lower  = llToLower(prefix);
+
+        // -------- Debug button: toggle global debug mode --------
+        if (lower == "debug")
+        {
+            gDebugMode = !gDebugMode;
+
+            if (gDebugMode)
+            {
+                llRegionSayTo(gHostID, 0,
+                    "[HUD] Debug mode ON. All HUD output will be owner-only; public chat is suppressed.");
+            }
+            else
+            {
+                llRegionSayTo(gHostID, 0,
+                    "[HUD] Debug mode OFF. Public chat restored; only errors will whisper to you.");
+            }
+
+            string dbgStr = "OFF";
+            if (gDebugMode)
+            {
+                dbgStr = "ON";
+            }
+
+            // Tell all engines about new mode
+            llMessageLinked(LINK_SET, LM_DEBUG_MODE, dbgStr, gHostID);
+            return;
+        }
+
+        // -------- Venue button: open selection dialog --------
+        if (lower == "venue")
+        {
+            if (llGetListLength(gVenueNotecards) == 0)
+            {
+                llOwnerSay("[CORE] No venue notecards found.");
+                return;
+            }
+
+            if (gListenHandle != -1) llListenRemove(gListenHandle);
+            gDialogPhase  = PHASE_VENUE;
+            gVenuePage    = 0;
+            gDjPage       = 0;
+            gListenHandle = llListen(CHANNEL_MENU, "", gHostID, "");
+            ShowVenueDialog();
+            Debug("Opening venue selection dialog.");
+            return;
+        }
+
+        // -------- Dance button: always works, even if not configured --------
+        if (lower == "dance")
+        {
+            Debug("Dance button pressed; sending MENU to DanceEngine.");
+            llMessageLinked(LINK_SET, LM_DANCE_ENGINE, "MENU", gHostID);
+            return;
+        }
+
+        // -------- DiscoBall button: rez dance ball from HUD --------
+        if (lower == "discoball")
+        {
+            Debug("Discoball button pressed; sending REZ_DANCEBALL to RezEngine.");
+            llMessageLinked(LINK_SET, LM_REZ_ENGINE, "REZ_DANCEBALL", gHostID);
+            return;
+        }
+
+        // -------- Tipjar button: rez tipjar from HUD --------
+        if (lower == "tipjar")
+        {
+            Debug("Tipjar button pressed; sending REZ_TIPJAR to RezEngine.");
+            llMessageLinked(LINK_SET, LM_REZ_ENGINE, "REZ_TIPJAR", gHostID);
+            return;
+        }
+
+        // Any other button requires config ready
+        if (!gConfigReady)
+        {
+            llOwnerSay("Config not ready yet. Please complete Venue & DJ selection and wait for configuration to finish.");
+            return;
+        }
+
+        // -------- Shout button: delegate menus to ShoutEngine --------
+        if (lower == "shout")
+        {
+            llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, "MENU", gHostID);
+            return;
+        }
+
+        // -------- Notice button: delegate menus to NoticeEngine --------
+        if (lower == "notice")
+        {
+            llMessageLinked(LINK_SET, LM_NOTICE_ENGINE, "MENU", gHostID);
+            return;
+        }
+
+        // -------- Socials button: now notecard-driven via SocialsEngine --------
+        if (lower == "socials")
+        {
+            llMessageLinked(LINK_SET, LM_SOCIALS_ENGINE, "MENU", gHostID);
+            return;
+        }
+
+        // -------- Manager / Security contact --------
+        if (lower == "manager" || lower == "security")
+        {
+            string cvMS = GetConfigValue(gVenueConfig, lower);
+            if (cvMS == "") cvMS = GetConfigValue(gDjConfig, lower);
+
+            Debug("Contact button '" + lower + "' pressed. Config value: '" + cvMS + "'");
+
+            if (cvMS != "")
+            {
+                llMessageLinked(LINK_SET, LM_CONTACT_ENGINE, cvMS, id);
+            }
+            else
+            {
+                llRegionSayTo(gHostID, 0,
+                    "No '" + prefix + "' UUID configured in current notecards.");
+            }
+            return;
+        }
+
+        // -------- Gestures button (GESTURES payload) --------
+        if (lower == "gestures")
+        {
+            string payloadGest = BuildGesturesPayload();
+            if (llSubStringIndex(payloadGest, "|") == -1)
+            {
+                llRegionSayTo(gHostID, 0, "No gestures defined in current notecards. Add lines like: gest_wave=/wave");
+                return;
+            }
+            Debug("Sending gestures payload: " + payloadGest);
+            llMessageLinked(LINK_SET, LM_GESTURE_ENGINE, payloadGest, gHostID);
+            return;
+        }
+
+        // -------- Emotes button (EMOTES payload) --------
+        if (lower == "emotes")
+        {
+            string payloadEm = BuildEmotesPayload();
+            if (llSubStringIndex(payloadEm, "|") == -1)
+            {
+                llRegionSayTo(gHostID, 0,
+                    "No emotes defined in current notecards. Add lines like: emote_wave=waves happily.");
+                return;
+            }
+            Debug("Sending emotes payload: " + payloadEm);
+            llMessageLinked(LINK_SET, LM_EMOTE_ENGINE, payloadEm, gHostID);
+            return;
+        }
+
+        // -------- Simple group button (quick group shout) --------
+        if (lower == "group")
+        {
+            string dGroup2 = GetConfigValue(gDjConfig, "group");
+            string vGroup2 = GetConfigValue(gVenueConfig, "group");
+
+            string msgGroup = "";
+            if (dGroup2 != "") msgGroup = "DJ Group: " + dGroup2;
+            if (vGroup2 != "")
+            {
+                if (msgGroup != "") msgGroup += "\n";
+                msgGroup += "Venue Group: " + vGroup2;
+            }
+
+            if (msgGroup == "")
+            {
+                llRegionSayTo(gHostID, 0, "Group button pressed but no group data in venue or DJ notecards.");
+            }
+            else
+            {
+                llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, msgGroup, NULL_KEY);
+            }
+            return;
+        }
+
+        // -------- Discord / Facebook / Twitch / icons --------
+        if (lower == "discord" || lower == "facebook" || lower == "twitch" ||
+            lower == "heart"   || lower == "coin"     || lower == "musicnote")
+        {
+            string cvIcon = GetConfigValue(gVenueConfig, lower);
+            if (cvIcon == "") cvIcon = GetConfigValue(gDjConfig, lower);
+
+            if (cvIcon != "")
+            {
+                llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, cvIcon, NULL_KEY);
+            }
+            else
+            {
+                llRegionSayTo(gHostID, 0, "No value configured for '" + prefix + "'.");
+            }
+            return;
+        }
+
+        // -------- Events: inventory item -> chooser menu, else shout text --------
+        if (lower == "events")
+        {
+            string cvEv = GetConfigValue(gVenueConfig, "events");
+            if (cvEv == "") cvEv = GetConfigValue(gDjConfig, "events");
+
+            if (cvEv == "")
+            {
+                llRegionSayTo(gHostID, 0, "No 'events' entry configured in current notecards.");
+                return;
+            }
+
+            // Hand raw config string to RezEngine; it will:
+            //  - look for a matching inventory item
+            //  - if found, show the “who to send to” menu
+            //  - if not found, treat it as text and shout ||-variants
+            llMessageLinked(
+                LINK_SET,
+                LM_REZ_ENGINE,
+                "EVENTS_RAW|" + cvEv,
+                gHostID
+            );
+            return;
+        }
+
+        // -------- Tip reminder quick shout (with variants) --------
+        if (lower == "tipremind")
+        {
+            string cvTip = GetConfigValue(gVenueConfig, "tipremind");
+            if (cvTip == "") cvTip = GetConfigValue(gDjConfig, "tipremind");
+
+            if (cvTip != "")
+            {
+                cvTip = PickRandomVariant(cvTip);
+                if (cvTip != "")
+                {
+                    llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, cvTip, NULL_KEY);
+                }
+            }
+            else
+            {
+                llRegionSayTo(gHostID, 0,
+                    "No 'tipremind' entry configured in current notecards.");
+            }
+            return;
+        }
+
+        // -------- Record quick shouts (with variants) --------
+        if (lower == "record")
+        {
+            string cvRec = GetConfigValue(gVenueConfig, "record");
+            if (cvRec == "") cvRec = GetConfigValue(gDjConfig, "record");
+            if (cvRec != "")
+            {
+                cvRec = PickRandomVariant(cvRec);
+                if (cvRec != "")
+                {
+                    llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, cvRec, NULL_KEY);
+                }
+            }
+            else
+            {
+                llRegionSayTo(gHostID, 0,
+                    "No 'record' entry configured in current notecards.");
+            }
+            return;
+        }
+
+        // -------- Application giver: open multi-role app menu --------
+        if (lower == "application")
+        {
+            Debug("Application button pressed; sending APP_MAIN_MENU to RezEngine.");
+            llMessageLinked(LINK_SET, LM_REZ_ENGINE, "APP_MAIN_MENU", gHostID);
+            return;
+        }
+
+        // -------- Cheat Sheet: give active venue & DJ notecards --------
+        if (lower == "cheatsheet" || lower == "cheat sheet")
+        {
+            if (gSelectedVenueCard != "" &&
+                llGetInventoryType(gSelectedVenueCard) == INVENTORY_NOTECARD)
+            {
+                llGiveInventory(gHostID, gSelectedVenueCard);
+            }
+            else
+            {
+                llRegionSayTo(gHostID, 0,
+                    "No active venue notecard selected to give.");
+            }
+
+            if (gSelectedDjCard != "" &&
+                llGetInventoryType(gSelectedDjCard) == INVENTORY_NOTECARD)
+            {
+                llGiveInventory(gHostID, gSelectedDjCard);
+            }
+            else
+            {
+                llRegionSayTo(gHostID, 0,
+                    "No active DJ notecard selected to give.");
+            }
+
+            return;
+        }
+
+        // -------- Radar / Timer toggles --------
+        if (lower == "radar")
+        {
+            llMessageLinked(LINK_SET, LM_RADAR_ENGINE, "MENU", gHostID);
+            return;
+        }
+
+        if (lower == "timer")
+        {
+            llMessageLinked(LINK_SET, LM_TIMER_ENGINE, "TOGGLE", gHostID);
+            return;
+        }
+
+        // -------- Shrink HUD (handled by HUD_Display; core does nothing) --------
+        if (lower == "shrink")
+        {
+            // HUD_Display listens for num==0, label "shrink" and does toggle.
+            return;
+        }
+
+        // -------- Fallback: show config value (debug only) --------
+        string anyVal = GetConfigValue(gVenueConfig, prefix);
+        if (anyVal == "") anyVal = GetConfigValue(gDjConfig, prefix);
+
+        if (anyVal != "")
+        {
+            Debug("Config entry '" + prefix + "' value: " + anyVal);
+        }
+        else
+        {
+            llRegionSayTo(gHostID, 0, "No configuration entry found for '" + prefix + "'.");
+        }
+    }
+
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel != CHANNEL_MENU) return;
+        if (id != gHostID) return;
+
+        msg = llStringTrim(msg, STRING_TRIM);
+
+        // -------- Venue selection with paging --------
+        if (gDialogPhase == PHASE_VENUE)
+        {
+            if (msg == "Cancel")
+            {
+                if (gListenHandle != -1)
+                {
+                    llListenRemove(gListenHandle);
+                    gListenHandle = -1;
+                }
+                gDialogPhase = PHASE_NONE;
+                return;
+            }
+            if (msg == "<< Prev")
+            {
+                gVenuePage = gVenuePage - 1;
+                ShowVenueDialog();
+                return;
+            }
+            if (msg == "Next >>")
+            {
+                gVenuePage = gVenuePage + 1;
+                ShowVenueDialog();
+                return;
+            }
+
+            integer idx = llListFindList(gVenueLabels, [msg]);
+            if (idx == -1)
+            {
+                llOwnerSay("[CORE] Unknown venue selection: " + msg);
+                return;
+            }
+
+            gSelectedVenueLabel = msg;
+            gSelectedVenueCard  = llList2String(gVenueNotecards, idx);
+            Debug("Selected venue label: " + gSelectedVenueLabel + " -> card: " + gSelectedVenueCard);
+
+            gDialogPhase = PHASE_DJ;
+            gDjPage      = 0;
+            ShowDjDialog();
+            return;
+        }
+
+        // -------- DJ selection with paging --------
+        if (gDialogPhase == PHASE_DJ)
+        {
+            if (msg == "Cancel")
+            {
+                if (gListenHandle != -1)
+                {
+                    llListenRemove(gListenHandle);
+                    gListenHandle = -1;
+                }
+                gDialogPhase = PHASE_NONE;
+                return;
+            }
+            if (msg == "<< Prev")
+            {
+                gDjPage = gDjPage - 1;
+                ShowDjDialog();
+                return;
+            }
+            if (msg == "Next >>")
+            {
+                gDjPage = gDjPage + 1;
+                ShowDjDialog();
+                return;
+            }
+
+            integer idx2 = llListFindList(gDjLabels, [msg]);
+            if (idx2 == -1)
+            {
+                llOwnerSay("[CORE] Unknown DJ selection: " + msg);
+                return;
+            }
+
+            gSelectedDjLabel = msg;
+            gSelectedDjCard  = llList2String(gDjNotecards, idx2);
+            Debug("Selected DJ label: " + gSelectedDjLabel + " -> card: " + gSelectedDjCard);
+
+            if (gListenHandle != -1)
+            {
+                llListenRemove(gListenHandle);
+                gListenHandle = -1;
+            }
+            gDialogPhase = PHASE_NONE;
+
+            // Start loading notecards
+            gVenueConfig = [];
+            gDjConfig    = [];
+
+            // Tell other engines this is a new config
+            llMessageLinked(LINK_SET, LM_SHOUT_ENGINE,   "CFG_RESET", NULL_KEY);
+            llMessageLinked(LINK_SET, LM_NOTICE_ENGINE,  "CFG_RESET", NULL_KEY);
+            llMessageLinked(LINK_SET, LM_SOCIALS_ENGINE, "CFG_RESET", NULL_KEY);
+
+            if (gSelectedVenueCard != "")
+            {
+                StartVenueLoad();
+            }
+            else if (gSelectedDjCard != "")
+            {
+                StartDjLoad();
+            }
+            return;
+        }
+    }
+
+    dataserver(key query_id, string data)
+    {
+        if (query_id != gCurrentQuery) return;
+        if (gLoadStage == 0) return; // not loading
+
+        if (data == EOF)
+        {
+            if (gLoadStage == 1 && gSelectedDjCard != "")
+            {
+                // Venue done, start DJ
+                StartDjLoad();
+                return;
+            }
+
+            // Finished last card
+            gLoadStage = 0;
+            FinalizeConfig();
+            return;
+        }
+
+        // Parse line for current card
+        string line = llStringTrim(data, STRING_TRIM);
+        if (line != "" && llGetSubString(line, 0, 0) != "#")
+        {
+            integer eq = llSubStringIndex(line, "=");
+            if (eq > 0)
+            {
+                string keyName = llStringTrim(llGetSubString(line, 0, eq - 1), STRING_TRIM);
+                string val = "";
+                integer last = llStringLength(line) - 1;
+                if (eq + 1 <= last)
+                {
+                    val = llStringTrim(llGetSubString(line, eq + 1, -1), STRING_TRIM);
+                }
+
+                string lowerKey = llToLower(keyName);
+
+                // Shout_* entries are delegated to ShoutEngine
+                if (llSubStringIndex(lowerKey, "shout_") == 0)
+                {
+                    string sourceS = "V";
+                    if (gLoadStage == 2) sourceS = "D";
+
+                    string cfgLineS = "CFG|" + sourceS + "|" + keyName + "|" + val;
+                    llMessageLinked(LINK_SET, LM_SHOUT_ENGINE, cfgLineS, NULL_KEY);
+                }
+
+                // All keys go to NoticeEngine so it can substitute @VENUE_NAME@ etc.
+                string sourceN = "V";
+                if (gLoadStage == 2) sourceN = "D";
+                string cfgLineN = "CFG|" + sourceN + "|" + keyName + "|" + val;
+                llMessageLinked(LINK_SET, LM_NOTICE_ENGINE,  cfgLineN, NULL_KEY);
+
+                // All keys also go to SocialsEngine for @DJ_*/@VENUE_*@ substitution
+                llMessageLinked(LINK_SET, LM_SOCIALS_ENGINE, cfgLineN, NULL_KEY);
+
+                // Only keep whitelisted keys in CORE's config lists
+                if (ShouldKeepKey(keyName))
+                {
+                    if (gLoadStage == 1)
+                    {
+                        gVenueConfig += [keyName, val];
+                    }
+                    else if (gLoadStage == 2)
+                    {
+                        gDjConfig += [keyName, val];
+                    }
+                }
+            }
+        }
+
+        // Request next line
+        gCurrentLine = gCurrentLine + 1;
+        gCurrentQuery = llGetNotecardLine(gCurrentCard, gCurrentLine);
+    }
+}
