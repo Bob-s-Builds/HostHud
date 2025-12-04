@@ -1,0 +1,608 @@
+// =========================================================
+// SocialsEngine.lsl - Notecard-driven socials builder
+// =========================================================
+//
+// Integration with CORE:
+//   - CORE sends config lines on LM_SOCIALS_ENGINE as:
+//       "CFG|V|key|value" for venue_ notecards
+//       "CFG|D|key|value" for dj_ notecards
+//   - CORE sends control:
+//       "MENU"      (id = host) when "socials" button is clicked
+//       "CFG_RESET"          when a new config is starting
+//       "CFG_READY" (id = host) when config finished (optional)
+//
+// Notecard templates:
+//   - Any notecard whose name starts with "social_" is a template.
+//   - Lines can contain tokens like:
+//       @DJ_NAME@, @VENUE_NAME@,
+//       @DJ_DISCORD@,   @VENUE_DISCORD@,
+//       @DJ_FACEBOOK@,  @VENUE_FACEBOOK@,
+//       @DJ_TWITCH@,    @VENUE_TWITCH@,
+//       @DJ_GROUP@,     @VENUE_GROUP@,
+//       @DJ_PRIMFEED@,  @VENUE_PRIMFEED@
+//
+//   Mapping to config keys:
+//       DJ_DISCORD      -> "discord"   in dj_ card
+//       VENUE_DISCORD   -> "discord"   in venue_ card
+//       DJ_FACEBOOK     -> "facebook"  in dj_ card
+//       VENUE_FACEBOOK  -> "facebook"  in venue_ card
+//       DJ_TWITCH       -> "twitch"    in dj_ card
+//       VENUE_TWITCH    -> "twitch"    in venue_ card
+//       DJ_GROUP        -> "group"     in dj_ card
+//       VENUE_GROUP     -> "group"     in venue_ card
+//       DJ_PRIMFEED     -> "primfeed"  in dj_ card
+//       VENUE_PRIMFEED  -> "primfeed"  in venue_ card
+//       VENUE_NAME      -> "venue_name" in venue_ card
+//       DJ_NAME         -> "dj_name"    in dj_ card
+//
+// Flow:
+//   1) socials button -> CORE -> LM_SOCIALS_ENGINE, "MENU", host
+//   2) SocialsEngine shows dialog: Random / Notecard / Cancel
+//   3) Random  -> random social_ card
+//      Notecard -> paged list of social_ cards
+//   4) Read chosen social_ card, substitute tokens, say final text on /0
+//      - Lines starting with '#' are treated as comments and skipped
+//      - Lines where any token resolves to an empty value are omitted
+//      - Blank template lines are ignored (no empty lines in output)
+// =========================================================
+
+integer LM_SOCIALS_ENGINE = 1009;    // MUST match CORE
+integer LM_DEBUG_MODE     = 1012;
+
+string  NC_SOCIAL_PREFIX  = "social_";
+integer SOCIAL_CHANNEL    = -99003;  // dialog channel (textbox not needed)
+
+// Dialog modes
+integer MODE_NONE      = 0;
+integer MODE_MAIN_MENU = 1;
+integer MODE_CARD_MENU = 2;
+
+// Globals
+key     gHostID      = NULL_KEY;
+integer gDebugMode   = FALSE;
+
+// Config storage separated by source
+list gVenueConfigPairs = [];  // [key, val, key, val, ...]
+list gDjConfigPairs    = [];
+
+// Social notecards
+list gSocialCards      = [];
+integer gSocialPage    = 0;   // for paging in card menu
+
+// Dialog state
+integer gListenHandle  = -1;
+integer gDialogMode    = MODE_NONE;
+
+// Current template read
+string  gPendingCard   = "";
+string  gNoteCardName  = "";
+integer gNoteLine      = 0;
+key     gNoteQuery     = NULL_KEY;
+string  gSocialMessage = "";
+
+// For "omit line if any token is empty"
+integer gDropCurrentLine = FALSE;
+
+// ----------------- HELPERS -----------------
+
+string Trim(string s)
+{
+    return llStringTrim(s, STRING_TRIM);
+}
+
+integer Debug(string msg)
+{
+    if (gDebugMode)
+    {
+        key target = gHostID;
+        if (target == NULL_KEY) target = llGetOwner();
+        if (target != NULL_KEY)
+        {
+            llInstantMessage(target, "[SOCIALS DEBUG] " + msg);
+        }
+    }
+    return 0;
+}
+
+// Set or update key in config list
+list SetConfig(list cfg, string keyName, string val)
+{
+    string keyLower = llToLower(keyName);
+    integer len = llGetListLength(cfg);
+    integer i   = 0;
+
+    while (i < len)
+    {
+        string k = llToLower(llList2String(cfg, i));
+        if (k == keyLower)
+        {
+            cfg = llListReplaceList(cfg, [keyName, val], i, i + 1);
+            return cfg;
+        }
+        i = i + 2;
+    }
+    cfg += [keyName, val];
+    return cfg;
+}
+
+// Retrieve value from config list
+string GetConfig(list cfg, string keyName)
+{
+    string keyLower = llToLower(keyName);
+    integer len = llGetListLength(cfg);
+    integer i   = 0;
+
+    while (i < len)
+    {
+        string k = llToLower(llList2String(cfg, i));
+        if (k == keyLower)
+        {
+            return llList2String(cfg, i + 1);
+        }
+        i = i + 2;
+    }
+    return "";
+}
+
+// Scan for social_ notecards in this prim
+list ScanSocialCards()
+{
+    list out = [];
+    integer total = llGetInventoryNumber(INVENTORY_NOTECARD);
+    integer i = 0;
+    string pfx = llToLower(NC_SOCIAL_PREFIX);
+
+    while (i < total)
+    {
+        string name = llGetInventoryName(INVENTORY_NOTECARD, i);
+        if (llSubStringIndex(llToLower(name), pfx) == 0)
+        {
+            out += [name];
+        }
+        i++;
+    }
+    return out;
+}
+
+// Return token value for a bare token like "DJ_DISCORD" (no @)
+string TokenValue(string token)
+{
+    string t = llToLower(Trim(token));
+
+    // Names
+    if (t == "venue_name") return GetConfig(gVenueConfigPairs, "venue_name");
+    if (t == "dj_name")    return GetConfig(gDjConfigPairs,    "dj_name");
+
+    // Socials mapping using underlying group/discord/facebook/twitch/primfeed
+    if (t == "dj_group")        return GetConfig(gDjConfigPairs,    "group");
+    if (t == "venue_group")     return GetConfig(gVenueConfigPairs, "group");
+    if (t == "dj_discord")      return GetConfig(gDjConfigPairs,    "discord");
+    if (t == "venue_discord")   return GetConfig(gVenueConfigPairs, "discord");
+    if (t == "dj_facebook")     return GetConfig(gDjConfigPairs,    "facebook");
+    if (t == "venue_facebook")  return GetConfig(gVenueConfigPairs, "facebook");
+    if (t == "dj_twitch")       return GetConfig(gDjConfigPairs,    "twitch");
+    if (t == "venue_twitch")    return GetConfig(gVenueConfigPairs, "twitch");
+    if (t == "dj_primfeed")     return GetConfig(gDjConfigPairs,    "primfeed");
+    if (t == "venue_primfeed")  return GetConfig(gVenueConfigPairs, "primfeed");
+
+    // Fallback: try direct key on venue then DJ
+    string v = GetConfig(gVenueConfigPairs, t);
+    if (v != "") return v;
+
+    v = GetConfig(gDjConfigPairs, t);
+    return v;
+}
+
+// Replace all @TOKEN@ patterns in a line.
+// Also sets gDropCurrentLine = TRUE if any token resolves to an empty value.
+string SubstituteTokens(string line)
+{
+    gDropCurrentLine = FALSE;
+
+    integer posStart = llSubStringIndex(line, "@");
+
+    while (posStart != -1)
+    {
+        integer len = llStringLength(line);
+        if (posStart >= len - 1) return line; // nothing beyond
+
+        string rest    = llGetSubString(line, posStart + 1, -1);
+        integer offset = llSubStringIndex(rest, "@");
+        if (offset == -1)
+        {
+            // no closing @; stop
+            return line;
+        }
+
+        integer posEnd = posStart + 1 + offset;
+
+        string tokenName = llGetSubString(line, posStart + 1, posEnd - 1);
+        string value     = TokenValue(tokenName);
+
+        // Mark for drop if this token is empty
+        if (value == "")
+        {
+            gDropCurrentLine = TRUE;
+        }
+
+        string before = "";
+        string after  = "";
+
+        if (posStart > 0)
+        {
+            before = llGetSubString(line, 0, posStart - 1);
+        }
+        if (posEnd + 1 <= len - 1)
+        {
+            after = llGetSubString(line, posEnd + 1, -1);
+        }
+
+        line = before + value + after;
+
+        posStart = llSubStringIndex(line, "@");
+    }
+
+    return line;
+}
+
+// Dialog helpers
+integer EnsureListen()
+{
+    if (gListenHandle == -1)
+    {
+        gListenHandle = llListen(SOCIAL_CHANNEL, "", gHostID, "");
+    }
+    return 0;
+}
+
+integer CloseListen()
+{
+    if (gListenHandle != -1)
+    {
+        llListenRemove(gListenHandle);
+        gListenHandle = -1;
+    }
+    gDialogMode = MODE_NONE;
+    return 0;
+}
+
+// Show the main socials menu
+integer ShowMainMenu()
+{
+    EnsureListen();
+    gDialogMode = MODE_MAIN_MENU;
+
+    list buttons = ["Random", "Notecard", "Cancel"];
+    llDialog(gHostID, "Socials options:", buttons, SOCIAL_CHANNEL);
+    return 0;
+}
+
+// Show the card selection menu with paging
+integer ShowCardMenu()
+{
+    integer total = llGetListLength(gSocialCards);
+
+    if (total == 0)
+    {
+        llRegionSayTo(gHostID, 0,
+            "[Socials] No social_ notecards found in this HUD.");
+        gDialogMode = MODE_NONE;
+        return 0;
+    }
+
+    EnsureListen();
+    gDialogMode = MODE_CARD_MENU;
+
+    integer pageSize = 7; // 7 cards + Prev + Next + Back + Cancel
+    integer maxPage  = (total - 1) / pageSize;
+
+    if (gSocialPage < 0)       gSocialPage = 0;
+    if (gSocialPage > maxPage) gSocialPage = maxPage;
+
+    integer start = gSocialPage * pageSize;
+    integer end   = start + pageSize - 1;
+    if (end >= total) end = total - 1;
+
+    list buttons = llList2List(gSocialCards, start, end);
+
+    if (total > pageSize)
+    {
+        if (gSocialPage > 0)       buttons += ["<< Prev"];
+        if (gSocialPage < maxPage) buttons += ["Next >>"];
+    }
+
+    buttons += ["Back", "Cancel"];
+
+    string msg = "Select a socials template (page " +
+                 (string)(gSocialPage + 1) + " of " +
+                 (string)(maxPage + 1) + "):";
+
+    llDialog(gHostID, msg, buttons, SOCIAL_CHANNEL);
+    return 0;
+}
+
+// Begin reading the selected social_ template notecard
+integer StartTemplateRead(string cardName)
+{
+    if (cardName == "") return 0;
+
+    gPendingCard   = cardName;
+    gNoteCardName  = cardName;
+    gNoteLine      = 0;
+    gSocialMessage = "";
+    gNoteQuery     = llGetNotecardLine(gNoteCardName, gNoteLine);
+
+    Debug("Begin reading socials template notecard: " + gNoteCardName);
+    return 0;
+}
+
+// ----------------- STATE -----------------
+
+default
+{
+    state_entry()
+    {
+        gHostID           = llGetOwner();
+        gDebugMode        = FALSE;
+        gVenueConfigPairs = [];
+        gDjConfigPairs    = [];
+        gSocialCards      = ScanSocialCards();
+        gSocialPage       = 0;
+
+        Debug("SocialsEngine initialized. Found " +
+              (string)llGetListLength(gSocialCards) +
+              " social_ notecards.");
+    }
+
+    on_rez(integer sp)
+    {
+        llResetScript();
+    }
+
+    changed(integer change)
+    {
+        if (change & (CHANGED_OWNER | CHANGED_INVENTORY))
+        {
+            llResetScript();
+        }
+    }
+
+    link_message(integer sender_num, integer num, string str, key id)
+    {
+        // Global debug toggle
+        if (num == LM_DEBUG_MODE)
+        {
+            string s = llToLower(Trim(str));
+            if (s == "on")
+            {
+                gDebugMode = TRUE;
+                Debug("Debug mode ON.");
+            }
+            else if (s == "off")
+            {
+                Debug("Debug mode OFF.");
+                gDebugMode = FALSE;
+            }
+            return;
+        }
+
+        if (num != LM_SOCIALS_ENGINE) return;
+
+        // Update host if provided
+        if (id != NULL_KEY)
+        {
+            gHostID = id;
+        }
+
+        string msg = Trim(str);
+
+        // Config reset from CORE
+        if (msg == "CFG_RESET")
+        {
+            Debug("Received CFG_RESET - clearing cached config.");
+            gVenueConfigPairs = [];
+            gDjConfigPairs    = [];
+            return;
+        }
+
+        // Config ready (optional)
+        if (msg == "CFG_READY")
+        {
+            Debug("Received CFG_READY from CORE.");
+            return;
+        }
+
+        // Button press: show main menu
+        if (msg == "MENU")
+        {
+            gSocialCards = ScanSocialCards();
+            gSocialPage  = 0;
+            ShowMainMenu();
+            return;
+        }
+
+        // Config line for socials engine: "CFG|V|key|value" or "CFG|D|key|value"
+        if (llSubStringIndex(msg, "CFG|") == 0)
+        {
+            list parts = llParseString2List(msg, ["|"], []);
+            if (llGetListLength(parts) >= 4)
+            {
+                string source  = llList2String(parts, 1); // "V" or "D"
+                string keyName = llList2String(parts, 2);
+                string val     = llList2String(parts, 3);
+
+                if (source == "V")
+                {
+                    gVenueConfigPairs = SetConfig(gVenueConfigPairs, keyName, val);
+                    Debug("VenueConfig: " + keyName + " = " + val);
+                }
+                else if (source == "D")
+                {
+                    gDjConfigPairs = SetConfig(gDjConfigPairs, keyName, val);
+                    Debug("DjConfig: " + keyName + " = " + val);
+                }
+            }
+            return;
+        }
+    }
+
+    listen(integer channel, string name, key id, string msg)
+    {
+        if (channel != SOCIAL_CHANNEL) return;
+        if (id != gHostID)             return;
+
+        string t = Trim(msg);
+
+        // Main socials menu
+        if (gDialogMode == MODE_MAIN_MENU)
+        {
+            if (t == "Cancel")
+            {
+                CloseListen();
+                return;
+            }
+
+            if (t == "Random")
+            {
+                integer count = llGetListLength(gSocialCards);
+                if (count == 0)
+                {
+                    llRegionSayTo(gHostID, 0,
+                        "[Socials] No social_ notecards found in this HUD.");
+                    gDialogMode = MODE_NONE;
+                    CloseListen();
+                    return;
+                }
+
+                integer idx = (integer)llFrand((float)count);
+                string card = llList2String(gSocialCards, idx);
+                StartTemplateRead(card);
+                return;
+            }
+
+            if (t == "Notecard")
+            {
+                gSocialCards = ScanSocialCards();
+                if (llGetListLength(gSocialCards) == 0)
+                {
+                    llRegionSayTo(gHostID, 0,
+                        "[Socials] No social_ notecards found in this HUD.");
+                    gDialogMode = MODE_NONE;
+                    CloseListen();
+                    return;
+                }
+
+                gSocialPage = 0;
+                ShowCardMenu();
+                return;
+            }
+
+            // Unknown option -> ignore
+            return;
+        }
+
+        // Card selection menu
+        if (gDialogMode == MODE_CARD_MENU)
+        {
+            if (t == "Cancel")
+            {
+                CloseListen();
+                return;
+            }
+
+            if (t == "Back")
+            {
+                ShowMainMenu();
+                return;
+            }
+
+            if (t == "Next >>")
+            {
+                gSocialPage++;
+                ShowCardMenu();
+                return;
+            }
+
+            if (t == "<< Prev")
+            {
+                gSocialPage--;
+                ShowCardMenu();
+                return;
+            }
+
+            // Otherwise it should be a card name
+            integer idx2 = llListFindList(gSocialCards, [t]);
+            if (idx2 == -1)
+            {
+                llRegionSayTo(gHostID, 0,
+                    "[Socials] Unknown template selection: " + t);
+                return;
+            }
+
+            StartTemplateRead(t);
+            return;
+        }
+
+        // If we reach here, we were not expecting input; ignore.
+    }
+
+    dataserver(key query_id, string data)
+    {
+        if (query_id != gNoteQuery) return;
+
+        if (data == EOF)
+        {
+            // Done reading template
+            gNoteQuery = NULL_KEY;
+
+            if (gSocialMessage != "")
+            {
+                // Final message in *local* chat for easy copy
+                llSay(0, gSocialMessage);
+                Debug("Socials output complete.");
+            }
+            else
+            {
+                llRegionSayTo(gHostID, 0,
+                    "[Socials] Template notecard was empty or had no usable lines.");
+            }
+
+            gSocialMessage = "";
+            return;
+        }
+
+        string line = Trim(data);
+
+        // Comment lines (starting '#') are skipped completely
+        if (line != "" && llGetSubString(line, 0, 0) == "#")
+        {
+            // do nothing (no blank line added)
+        }
+        else if (line != "")
+        {
+            // Replace tokens and possibly drop line if any token was empty
+            line = SubstituteTokens(line);
+
+            // If any token resolved to empty OR the final line is empty after trim, skip it
+            if (!gDropCurrentLine && Trim(line) != "")
+            {
+                if (gSocialMessage == "")
+                {
+                    gSocialMessage = line;
+                }
+                else
+                {
+                    gSocialMessage += "\n" + line;
+                }
+            }
+        }
+        else
+        {
+            // Blank template line: ignore completely, no extra newline
+        }
+
+        // Next line
+        gNoteLine++;
+        gNoteQuery = llGetNotecardLine(gNoteCardName, gNoteLine);
+    }
+}
